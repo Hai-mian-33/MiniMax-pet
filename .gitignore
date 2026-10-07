@@ -1,0 +1,43 @@
+# ---- 运行时产物：全部由程序自己生成，不进版本库 ----
+pet_state.json
+pet.log
+*.pid
+*.lock
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 自检中间文件（截图本体 docs/images/*.png 是要提交的）----
+selftest/
+*.tmp
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ---- 临时上传产物 ----
+*.zip
+*.tar.gz
