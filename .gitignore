@@ -43,3 +43,7 @@ $RECYCLE.BIN/
 # ---- 临时上传产物 ----
 *.zip
 *.tar.gz
+
+# ---- 手动退出标记 / 临时诊断脚本 ----
+pet_paused.flag
+_tmp_probe.py
