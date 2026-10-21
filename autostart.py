@@ -119,10 +119,15 @@ def _port_open(port, timeout=0.3):
 
 
 def _cmdlines():
-    """pythonw 进程的命令行列表（小写）。
+    """pythonw 进程的命令行**列表**（小写，每行一个）。
 
     注意不能用 `tasklist` 匹配命令行——它的 CSV 输出里根本没有命令行字段，
     永远匹配不上。
+
+    ⚠️ 这里必须返回**列表**。以前返回的是「把所有命令行拼成的一整块文本」，
+    再拿 `"pet_watcher.py" in cl` 做子串判断——本机同时装着另外两个桌宠，
+    它们的路径里正好含有这个子串，于是本项目的 status 把**别人的进程当成
+    自己的**，一律报「在跑 ✓」。出问题时这句话极具误导性。
     """
     try:
         out = subprocess.run(
@@ -130,25 +135,74 @@ def _cmdlines():
              "(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" "
              "-ErrorAction SilentlyContinue).CommandLine"],
             capture_output=True, text=True, errors="replace", timeout=25)
-        return (out.stdout or "").lower()
+        return [ln.strip().lower() for ln in (out.stdout or "").splitlines()
+                if ln.strip()]
     except Exception:
-        return ""
+        return []
+
+
+def _mine(script, lines):
+    """命令行里有没有**本项目**的这个脚本。
+
+    要求同时命中脚本名和项目目录名（minimax-pet），这样别的项目里同名的
+    pet_watcher.py 不会被认成我们的。
+    """
+    proj = os.path.basename(BASE).lower()
+    return any(script in ln and proj in ln for ln in lines)
+
+
+def _pet_http():
+    """探桌宠的 HTTP 端口，并且**确认回话确实是它**。
+
+    只 connect 不说话是有坑的：8766 被别的程序占着时也算「桌宠在跑」。
+    这里 GET 一下并检查正文里的特征串。
+    """
+    for p in range(8766, 8777):
+        s = socket.socket()
+        s.settimeout(0.6)
+        try:
+            s.connect(("127.0.0.1", p))
+            s.sendall(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+            buf = b""
+            while len(buf) < 400:
+                chunk = s.recv(200)
+                if not chunk:
+                    break
+                buf += chunk
+            if b"minimax pet ok" in buf.lower():
+                return True
+        except Exception:
+            continue
+        finally:
+            s.close()
+    return False
 
 
 def _pet_running():
     """桌宠是否在跑。
 
-    先探 HTTP 端口（快、无子进程）；探不到再查进程命令行，用来覆盖
-    `--no-server` 关掉 HTTP 的情况。
+    先探 HTTP 端口（快、无子进程）并核对回话内容；探不到再查进程命令行，
+    用来覆盖 `--no-server` 关掉 HTTP 的情况。
     """
-    for p in range(8766, 8777):
-        if _port_open(p):
-            return True
-    return "minimax_pet.py" in _cmdlines()
+    if _pet_http():
+        return True
+    return _mine("minimax_pet.py", _cmdlines())
 
 
 def _watcher_running():
-    return "pet_watcher.py" in _cmdlines()
+    return _mine("pet_watcher.py", _cmdlines())
+
+
+def _pause_left():
+    """「用户手动退出过桌宠」的剩余秒数；没在暂停返回 0。"""
+    p = os.path.join(BASE, "pet_paused.flag")
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            ts = float(f.read().strip() or 0)
+        left = ts - time.time()
+        return int(left) if 0 < left <= 3 * 24 * 3600 else 0
+    except Exception:
+        return 0
 
 
 def status():
@@ -171,6 +225,12 @@ def status():
           + (t("auto.v_yes") if _watcher_running() else t("auto.v_no")))
     print(t("auto.row_pet_running") + ": "
           + (t("auto.v_yes") if _pet_running() else t("auto.pet_not_running")))
+    left = _pause_left()
+    if left:
+        print(t("auto.paused") + ": "
+              + t("auto.paused_left", left // 60))
+    print(t("auto.row_keepalive") + ": "
+          + (t("auto.keepalive_on") if _task_present() else t("auto.keepalive_off")))
     if os.path.exists(VBS):
         try:
             with open(VBS, "r", encoding="mbcs") as f:
@@ -209,6 +269,111 @@ def verify():
     return 1
 
 
+# ========== 计划任务：定时「确保有人活着」 ==========
+# 互相看门有个绕不过去的盲区：哨兵和桌宠在同一瞬间一起没了，就再也没人
+# 拉起它们（登录启动项只在登录那一刻跑一次）。计划任务定期跑
+# `pet_watcher.py --ensure` 把这个状态补上。
+#
+# ⚠️ 用的是 --ensure 而不是 --resume：resume 会清掉「用户主动退出桌宠」的
+# 暂停标记，定时清的话你手动关掉的桌宠 5 分钟后自己就回来了。ensure 尊重
+# 暂停，只负责「没人看门了」这一种情况。
+TASK_NAME = "MiniMaxPetKeepAlive"
+TASK_MINUTES = 5
+
+
+def _task_present():
+    try:
+        out = subprocess.run(
+            ["schtasks", "/Query", "/TN", TASK_NAME],
+            capture_output=True, text=True, errors="replace", timeout=30)
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def _ps(script):
+    """跑一段 PowerShell，返回 (rc, stdout+stderr)。"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", script],
+            capture_output=True, text=True, errors="replace", timeout=120)
+        return out.returncode, ((out.stdout or "") + (out.stderr or "")).strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def keepalive_on():
+    """建一个每 5 分钟跑一次 --ensure 的计划任务。"""
+    if _task_present():
+        print(t("auto.keepalive_recreate"))
+        keepalive_off()
+    exe = pythonw_path()
+    arg = '"%s" --ensure' % WATCHER
+    # 交互式登录（InteractiveToken）：必须跑在用户自己的会话里，否则它拉起
+    # 的桌宠虽然是 GUI 进程，却不在你的桌面上。
+    script = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$a = New-ScheduledTaskAction -Execute '%s' -Argument '%s'\n"
+        "$t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) "
+        "-RepetitionInterval (New-TimeSpan -Minutes %d)\n"
+        "$t.Repetition.Duration = 'P3650D'\n"
+        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
+        "-DontStopIfGoingOnBatteries -StartWhenAvailable "
+        "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)\n"
+        "$p = New-ScheduledTaskPrincipal -UserId (\"$env:USERDOMAIN\\$env:USERNAME\") "
+        "-LogonType Interactive -RunLevel Limited\n"
+        "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false "
+        "-ErrorAction SilentlyContinue\n"
+        "Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -Settings $s "
+        "-Principal $p -Description 'MiniMax Pet keepalive' | Out-Null\n"
+        "Write-Output 'CREATED'\n"
+        % (exe.replace("'", "''"), arg.replace("'", "''"), TASK_MINUTES,
+           TASK_NAME, TASK_NAME))
+    rc, out = _ps(script)
+    if rc != 0 or "CREATED" not in out:
+        print(t("auto.keepalive_fail", out))
+        return 1
+    print(t("auto.keepalive_ok", TASK_NAME, TASK_MINUTES))
+    _row(t("auto.row_keepalive_cmd"), exe + " " + arg)
+    _row(t("auto.keepalive_note"), t("auto.keepalive_note_txt"))
+    _row(t("auto.undo"), t("auto.keepalive_undo_cmd"))
+    return 0
+
+
+def keepalive_off():
+    if not _task_present():
+        print(t("auto.keepalive_none"))
+        return 0
+    rc, out = _ps("Unregister-ScheduledTask -TaskName '%s' -Confirm:$false; "
+                  "Write-Output 'REMOVED'" % TASK_NAME)
+    if rc != 0 or "REMOVED" not in out:
+        print(t("auto.keepalive_fail", out))
+        return 1
+    print(t("auto.keepalive_removed", TASK_NAME))
+    return 0
+
+
+def keepalive_status():
+    print(t("auto.row_keepalive") + ": "
+          + (t("auto.keepalive_on") if _task_present()
+             else t("auto.keepalive_off")))
+    if _task_present():
+        try:
+            out = subprocess.run(
+                ["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"],
+                capture_output=True, text=True, errors="replace", timeout=30)
+            for line in (out.stdout or "").splitlines():
+                line = line.strip()
+                if line and not line.startswith("Folder:"):
+                    print("   " + line)
+        except Exception as e:
+            print(t("auto.keepalive_fail", e))
+    else:
+        print(t("auto.keepalive_enable_cmd"))
+    return 0
+
+
 def _resolve_lang(argv):
     """返回 --lang 的值，并把它（连同它的参数）从 argv 里摘掉。
 
@@ -243,8 +408,18 @@ if __name__ == "__main__":
     set_lang(_lang or _saved or system_lang())
 
     cmd = _rest[0].strip().lower() if _rest else "status"
+    if cmd == "keepalive":
+        sub = _rest[1].strip().lower() if len(_rest) > 1 else "status"
+        fn2 = {"on": keepalive_on, "off": keepalive_off,
+               "status": keepalive_status}.get(sub)
+        if fn2 is None:
+            sys.stderr.write("用法 / usage: python autostart.py keepalive "
+                             "on|off|status\n")
+            sys.exit(2)
+        sys.exit(fn2() or 0)
     fn = {"on": on, "off": off, "status": status, "verify": verify}.get(cmd)
     if fn is None:
-        sys.stderr.write("用法 / usage: python autostart.py on|off|status|verify\n")
+        sys.stderr.write("用法 / usage: python autostart.py on|off|status|verify"
+                         "|keepalive on|off|status\n")
         sys.exit(2)
     sys.exit(fn() or 0)

@@ -400,6 +400,9 @@ class TestExitWithApp(unittest.TestCase):
         self.pet.follow = True
         self.pet.manual_hidden = False
         self.pet.exit_with_app = True
+        # v1.1: 「跟随」跟进程还是跟窗口。默认按进程（关掉窗口、后台 agent
+        # 继续跑时桌宠也继续显示）。
+        self.pet.follow_mode = mp.FOLLOW_MODE_PROCESS
         self.pet.quit_calls = 0
         self.pet.visible = True
         self.pet.quit = lambda: setattr(self.pet, "quit_calls",
@@ -407,6 +410,8 @@ class TestExitWithApp(unittest.TestCase):
         self.pet.isVisible = lambda: self.pet.visible
         self.pet._sync_visibility = lambda running: setattr(
             self.pet, "visible", bool(running))
+        # 反向看门：测试里绝不能真的去拉起一个哨兵进程
+        self.pet._ensure_watcher = lambda: None
         self._orig_app_running = mp.app_running
         mp.app_running = lambda: self._running
 

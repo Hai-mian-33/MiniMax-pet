@@ -46,7 +46,8 @@ try:
     from PyQt5.QtGui import (QPainter, QColor, QPen, QFont, QFontMetrics, QIcon,
                              QPixmap, QGuiApplication, QPainterPath)
     from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout,
-                                 QHBoxLayout, QMenu, QSystemTrayIcon)
+                                 QHBoxLayout, QMenu, QSystemTrayIcon,
+                                 QActionGroup)
 except ImportError as _imp_err:      # pragma: no cover
     sys.stderr.write("缺少依赖 PyQt5，请先执行: pip install PyQt5\n"
                      "Missing dependency PyQt5 — run: pip install PyQt5\n"
@@ -93,6 +94,27 @@ WAITING   = "#F97316"
 DEFAULT_PORT = 8766
 MAX_CARDS    = 6
 
+# 「跟随 MiniMax Code」到底跟什么，两个口径，用户可切换：
+#   process —— 进程还在就算开着。**这是默认**：用户要的是「关掉窗口、后台
+#              agent 继续跑，桌宠也继续显示」；Electron 关窗口常常只隐藏界面，
+#              后台进程赖着不走，按进程判才不会莫名其妙把桌宠也藏了。
+#   window  —— 非要有 visible/minimized 的窗口才算开着。按窗口关掉 → 桌宠跟着藏。
+# 退出永远只看进程（app_running），跟这个选择无关。
+FOLLOW_MODE_PROCESS = "process"
+FOLLOW_MODE_WINDOW = "window"
+FOLLOW_MODES = (FOLLOW_MODE_PROCESS, FOLLOW_MODE_WINDOW)
+FOLLOW_MODE_TEXT = {
+    FOLLOW_MODE_PROCESS: "follow.mode_process",
+    FOLLOW_MODE_WINDOW: "follow.mode_window",
+}
+
+
+def follow_mode_text(mode):
+    """跟随依据的说明（走 i18n）。"""
+    k = FOLLOW_MODE_TEXT.get(mode)
+    return t(k) if k else t("follow.mode_menu")
+
+
 # MiniMax Code 桌面版进程名特征（实测 exe = "MiniMax Code.exe"）
 APP_PROCESS_HINT = "minimax code"
 APP_TITLE_HINT   = "minimax code"
@@ -134,6 +156,70 @@ FONT_SCALE = 1.2
 # UI_SCALE 仅供 --selftest-scale 用（按 N 倍渲染当前实际尺寸查细节），正常运行为 1.0
 UI_SCALE = 1.0
 
+# ========== 显示器缩放补偿 ==========
+# 为什么需要它
+# ------------------------------------------------------------------------------
+# 以前所有几何都是**逻辑像素**。Qt 渲染时会按所在屏幕的 DPR（缩放比例）把逻辑
+# 像素再放大一次，于是物理尺寸 = 逻辑尺寸 × DPR：
+#     100% 缩放的外接显示器  → 102 × 1.0 = 102 物理像素（刚好的样子）
+#     200% 缩放的笔记本内屏  → 102 × 2.0 = 204 物理像素（突然大一倍）
+# 这就是「接显示器时刚好好、拔掉显示器后桌宠偏大」的根因。
+#
+# 怎么修
+# ------------------------------------------------------------------------------
+# 把尺寸**锚定在物理像素**：逻辑 = 物理 ÷ 缩放比例。渲染时再乘回同一个比例，
+# 一除一乘正好抵消，不管插拔显示器、不管系统缩放是 100% 还是 200%，
+# **屏幕上的物理大小恒定**。显示器变化时重新量一次即可。
+_SCREEN_DPR = 1.0            # 当前锚定屏幕的 Qt DPR（初值，量过之后以实测为准）
+# 实测出来的「逻辑像素 → 物理像素」比例。Qt 报的 devicePixelRatio 通常是对的，
+# 但不保证在所有缩放组合下都准（多屏混合缩放、DPI 虚拟化、驱动默认值都可能
+# 让它和窗口实际表现对不上）。所以窗口出来之后用 GetWindowRect 量一次真实值，
+# 对不上就按实测重算——不信任任何单一来源。
+_PX_FACTOR = None
+# 当前屏幕名，缓存给 HTTP 诊断接口用（那个 handler 跑在子线程，不能直接问 Qt）
+_SCREEN_NAME = t("screen.unknown")
+
+# 用户档位（右键菜单可调，存在 pet_state.json 里）
+SIZE_LEVEL = 1.0
+SIZE_LEVELS = [0.75, 0.9, 1.0, 1.15, 1.35]
+SIZE_LEVEL_NAMES = {0.75: "size.level.0.75", 0.9: "size.level.0.9",
+                   1.0: "size.level.1.0", 1.15: "size.level.1.15",
+                   1.35: "size.level.1.35"}
+
+
+def size_level_name(level):
+    """档位名（走 i18n，界面语言切换后立即跟着变）。"""
+    k = SIZE_LEVEL_NAMES.get(level)
+    return t(k) if k else t("size.level.custom")
+
+
+def _dpr():
+    """当前锚定屏幕的 DPR。取不到就用 1.0（等价于不做任何补偿）。"""
+    d = _SCREEN_DPR
+    try:
+        if d and 0.25 < float(d) < 8.0:
+            return float(d)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _scale():
+    """真正用于换算的比例：优先实测值，没有实测值才退回 Qt 的 DPR。"""
+    if _PX_FACTOR:
+        try:
+            f = float(_PX_FACTOR)
+            if 0.25 < f < 8.0:
+                return f
+        except Exception:
+            pass
+    return _dpr()
+
+
+def _fsize():
+    """几何/字号的公共缩放因子：设计稿 → 逻辑像素。"""
+    return UI_SCALE * SIZE_LEVEL / _scale()
+
 # 字体栈：Qt 会按这个顺序做「逐字形」回退，顺序错了就会掉进豆腐块。
 #   Segoe UI            -> 拉丁字母与数字
 #   Segoe UI Symbol     -> ✓ ⏸ ✕ ▶ 等符号（实测唯一覆盖 U+2713/U+23F8 的字体，必须紧跟主字体）
@@ -154,28 +240,47 @@ def ui_font(px_size, bold=True):
 
 
 def _px(v):
-    """几何尺寸换算：跟 UI_SCALE × SIZE_RATIO 走。"""
-    return max(1, int(round(v * UI_SCALE * SIZE_RATIO)))
+    """几何尺寸换算：跟 UI_SCALE × SIZE_RATIO × 档位走，再除以屏幕 DPR。
+
+    除 DPR 这一步是为了让**物理**尺寸与显示器缩放无关，见上面 _SCREEN_DPR 的说明。
+    """
+    return max(1, int(round(v * UI_SCALE * SIZE_RATIO * _fsize())))
 
 
 def _fpx(v):
-    """字号换算：跟 UI_SCALE 走，但用 FONT_SCALE 而不是 SIZE_RATIO。
+    """字号换算：跟 UI_SCALE × 档位走，但用 FONT_SCALE 而不是 SIZE_RATIO。
 
     桌宠缩小了字不该跟着缩——卡片变窄只影响能放几个字，不影响字本身多清晰。
+    字号同样要除 DPR：窗口整体缩了，里面的字不缩就会撑爆。
     """
-    return max(7, int(round(v * UI_SCALE * FONT_SCALE)))
+    return max(7, int(round(v * UI_SCALE * FONT_SCALE * _fsize())))
 
 
-# 表情动画幅度：跟**视觉尺寸**走（UI_SCALE × SIZE_RATIO），不是跟字号走。
-# 运行时读取，所以 --selftest-scale 改 UI_SCALE 后依然正确。
+# 表情动画幅度：跟**视觉尺寸**走，不是跟字号走。
+# 运行时读取，所以 --selftest-scale 改 UI_SCALE、换 DPR 改档位后依然正确。
 def _draw_k():
-    return UI_SCALE * SIZE_RATIO
+    return UI_SCALE * SIZE_RATIO * _fsize()
 
 
 # ========== 尺寸（全部由 SIZE_RATIO 驱动）==========
 # 设计稿原始尺寸
 _D_BODY_W, _D_BODY_H, _D_CHIP_H = 128, 132, 22
-# 桌宠本体与状态胶囊：下面有几处是**不加 _px** 直接用的，所以这里先换算好
+
+
+def recalc_pet_size():
+    """按当前 DPR 与档位重算「提前换算过」的几何常量。
+
+    BODY_W / CHIP_H 有几处是直接拿来用的（控件 setFixedSize、胶囊高度），
+    不走 _px()，所以档位或 DPR 变了必须显式重算。返回新的 PET_SIZE。
+    """
+    global BODY_W, BODY_H, CHIP_H, PET_SIZE
+    BODY_W = _px(_D_BODY_W)
+    BODY_H = _px(_D_BODY_H)
+    CHIP_H = _px(_D_CHIP_H)
+    PET_SIZE = (BODY_W, BODY_H + CHIP_H + _px(6))
+    return PET_SIZE
+
+
 BODY_W   = _px(_D_BODY_W)
 BODY_H   = _px(_D_BODY_H)
 CHIP_H   = _px(_D_CHIP_H)
@@ -226,30 +331,60 @@ if sys.platform == "win32":
     _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     _TH32CS_SNAPPROCESS = 0x2
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _K32_BOUND = False
 else:
     _u32 = _k32 = None
     _ENUMPROC = None
+    _TH32CS_SNAPPROCESS = 0x2
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _INVALID_HANDLE_VALUE = -1
+    _K32_BOUND = True
+
+
+# PROCESSENTRY32W 必须定义在**模块级**。
+# 如果写在 _iter_processes() 内部，每次调用都会新建一个类对象，于是
+# argtypes 里绑定的 POINTER(_PE32) 只认第一次那个类；第二次扫描起
+# ctypes 就抛 ArgumentError。而 app_pids() 会把异常吞掉返回空集，
+# app_running() 因此永远返回 False —— 桌宠会误以为 MiniMax Code 没了，
+# 先把自己藏起来，几秒后再自杀退出。这是个非常难查的坑，必须模块级。
+class _PE32(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260)]
 
 
 def _iter_processes():
     """遍历系统进程，产出 (pid, exe 名)。"""
+    global _K32_BOUND
     if _k32 is None:
         return
 
-    class _PE32(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_wchar * 260)]
+    if not _K32_BOUND:
+        # 不声明 restype 的话，ctypes 按 c_int 返回 HANDLE，64 位下高位会被
+        # 截断；再把这个被截断的值喂给 CloseHandle，关掉的就不是那个句柄了。
+        try:
+            _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            _k32.Process32FirstW.restype = wintypes.BOOL
+            _k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PE32)]
+            _k32.Process32NextW.restype = wintypes.BOOL
+            _k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PE32)]
+            _k32.CloseHandle.restype = wintypes.BOOL
+            _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        except Exception:
+            pass
+        _K32_BOUND = True
 
     snap = _k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-    if snap == -1:
+    if not snap or snap == _INVALID_HANDLE_VALUE:
         return
     try:
         e = _PE32()
@@ -264,14 +399,23 @@ def _iter_processes():
 
 
 def app_pids():
-    """MiniMax Code 桌面版的所有进程 id 集合。"""
+    """MiniMax Code 桌面版的所有进程 id 集合。
+
+    扫描本身出问题时必须抛出去，不能安静地返回空集：空集会被 app_running()
+    读成「应用没开」，于是桌宠误以为 MiniMax Code 关闭了，先隐藏自己，
+    再自杀退出。宁可让上层按「探测失败=按存活处理」兜底。
+    """
     out = set()
+    seen_any = False
     try:
         for pid, exe in _iter_processes():
+            seen_any = True
             if APP_PROCESS_HINT in exe.lower():
                 out.add(pid)
     except Exception:
-        pass
+        raise
+    if not seen_any:
+        raise RuntimeError(t("log.win.scan_empty"))
     return out
 
 
@@ -284,6 +428,30 @@ def app_running():
         return bool(pids)
     except Exception:
         return True
+
+
+def app_foreground():
+    """应用是不是「开着」——**真的有窗口**才算开着。
+
+    必须和 app_running() 分开看，因为这两个口径回答的是不同问题：
+
+    · app_running()   —— 进程在吗？管「应用要不要退出 / 哨兵要不要守」。
+    · app_foreground()—— 窗口在吗？管「桌宠要不要显示」。
+
+    用户反馈过「点关闭键之后后台进程还留着」：这时候 app_running() 仍是 True，
+    按它判显隐的话，窗口都关了的桌宠还会一直杵在桌面上，而菜单里那条开关
+    写的就是「跟随 MiniMax Code 开关」——跟的是窗口，不是进程。
+
+    探测失败时退回 app_running()，宁可多显示也不要凭空消失。
+    """
+    try:
+        wins = app_windows()
+    except Exception:
+        return app_running()
+    for h, _t, _v, _a in wins:
+        if _window_state(h) in ("visible", "minimized"):
+            return True
+    return False
 
 
 def _dwm_cloaked(hwnd):
@@ -341,30 +509,289 @@ def app_windows():
     return out
 
 
-def pick_app_window():
-    """挑最适合置前的窗口；全被隐藏时也返回它，以便从托盘还原。"""
-    wins = app_windows()
-    if not wins:
-        return None
-    for h, title, visible, _a in wins:
-        if visible and APP_TITLE_HINT in title.lower():
-            return h
-    for h, _t, visible, _a in wins:
-        if visible:
-            return h
-    return wins[0][0]
+# ---------- 召唤 MiniMax Code：绝不去「复活」一个僵死的窗口 ----------
+#
+# 要防的现象：用户点关闭键之后，Electron 主进程还活着（后台 agent 还在跑），
+# 但浏览器窗口已经销毁 / 僵死 —— HWND 还在、最后一帧还留在屏幕上，
+# 渲染进程却已经没了。这时候对窗口 ShowWindow(SW_SHOW) 去「复活」它，
+# 结果就是**界面完整渲染、但整个点不动**，正是用户截图里那个卡死的窗口。
+#
+# 所以顺序必须是：
+#   1. 先探窗口线程还活不活（SendMessageTimeout + SMTO_ABORTIFHUNG）；
+#   2. 只有「活着」的窗口才允许被还原 / 置前；
+#   3. 全是僵死窗口 → 先 WM_CLOSE 让它体面退，再结束掉仍僵的进程树，
+#      最后拉起一个全新实例。
+#
+# ⚠️ 整套探测最坏要好几秒（探活 + 等体面退出 + 等新窗口冒头），
+#    所以 activate_app() **只在子线程里调用**，绝不能放 Qt 主线程，
+#    否则桌宠自己会被冻住。
+WM_NULL_ = 0x0000
+WM_CLOSE_ = 0x0010
+SMTO_BLOCK_ = 0x0001
+SMTO_ABORTIFHUNG_ = 0x0002
+PROC_TERMINATE_ = 0x0001
+PROC_SYNCHRONIZE_ = 0x0400
+PROC_QUERY_LIMITED_ = 0x1000
+
+HUNG_PROBE_MS = 600        # 粗探：僵死窗口会**立刻**返回，所以并不贵
+HUNG_CONFIRM_MS = 1200     # 动刀之前的复核
+CLOSE_GRACE_S = 1.2        # WM_CLOSE 之后留给它体面退出的时间
+RELAUNCH_WAIT_S = 9.0      # 等新窗口冒头
+_MAX_PROBE_WINDOWS = 6     # 一次最多探这么多个窗口
+
+_EXTRA_BOUND = False
+_ANCESTORS = None
 
 
-def activate_app():
-    """把 MiniMax Code 带到前台；最小化 / 收进托盘都会还原。成功返回 True。"""
-    hwnd = pick_app_window()
-    if not hwnd:
-        return False
+def _bind_extra():
+    """补齐「探窗口 / 结束进程 / 问 exe 路径」这批 API 的签名。
+
+    restype / argtypes 必须在第一次调用**之前**绑好：ctypes 默认按 c_int
+    收返回值，64 位下 HANDLE 高位会被截断，拿到的根本不是那个句柄
+    （老坑：截断后的句柄再拿去 CloseHandle，关掉的是另一个句柄）。
+
+    每条**单独** try：曾经把 OpenProcess 写成了 user32.OpenProcess，
+    一失败整个块中断在中间，排在它后面的 QueryFullProcessImageName /
+    TerminateProcess / CloseHandle 签名全都没绑上 —— 静默地退化成
+    64 位句柄截断，比直接报错难查得多。
+    """
+    global _EXTRA_BOUND
+    if _EXTRA_BOUND or _u32 is None:
+        return _EXTRA_BOUND
+    _SZ = ctypes.c_size_t
+    _P_SZ = ctypes.POINTER(ctypes.c_size_t)
+    specs = [
+        # (库, 函数名, restype, argtypes)
+        (_u32, "SendMessageTimeoutW", _SZ,
+         [wintypes.HWND, wintypes.UINT, _SZ, _SZ, wintypes.UINT,
+          wintypes.UINT, _P_SZ]),
+        (_u32, "PostMessageW", wintypes.BOOL,
+         [wintypes.HWND, wintypes.UINT, _SZ, _SZ]),
+        (_k32, "QueryFullProcessImageNameW", wintypes.BOOL,
+         [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+          ctypes.POINTER(wintypes.DWORD)]),
+        (_k32, "OpenProcess", wintypes.HANDLE,
+         [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
+        (_k32, "TerminateProcess", wintypes.BOOL,
+         [wintypes.HANDLE, wintypes.UINT]),
+        (_k32, "CloseHandle", wintypes.BOOL, [wintypes.HANDLE]),
+        (_k32, "GetCurrentProcessId", wintypes.DWORD, []),
+    ]
+    for lib, name, restype, argtypes in specs:
+        try:
+            fn = getattr(lib, name)
+            fn.restype = restype
+            fn.argtypes = argtypes
+        except Exception as e:
+            log("warn", t("log.win.bind_fail", name, e))
+    _EXTRA_BOUND = True
+    return _EXTRA_BOUND
+
+
+def window_pid(hwnd):
+    pid = wintypes.DWORD(0)
     try:
+        _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
+
+
+def window_responsive(hwnd, ms=HUNG_PROBE_MS):
+    """窗口所属线程还在泵消息吗？
+
+    探不出来（异常 / 平台不支持）时**按「活着」处理**——宁可照常显示，
+    也不能因为探测失败就把用户正在用的窗口杀掉。
+    """
+    if _u32 is None:
+        return True
+    try:
+        if not _u32.IsWindow(hwnd):
+            return False
+        _bind_extra()
+        res = ctypes.c_size_t(0)
+        r = _u32.SendMessageTimeoutW(wintypes.HWND(hwnd), WM_NULL_, 0, 0,
+                                      SMTO_ABORTIFHUNG_ | SMTO_BLOCK_,
+                                      int(ms), ctypes.byref(res))
+        return bool(r)
+    except Exception as e:
+        log("warn", t("log.win.probe_exc", e))
+        return True
+
+
+def _pid_parent_map():
+    """pid → ppid 全表。"""
+    out = {}
+    if _k32 is None:
+        return out
+    try:
+        list(_iter_processes())          # 顺手把 _K32_BOUND 那套绑完
+        snap = _k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == _INVALID_HANDLE_VALUE:
+            return out
+        try:
+            e = _PE32()
+            e.dwSize = ctypes.sizeof(e)
+            if _k32.Process32FirstW(snap, ctypes.byref(e)):
+                while True:
+                    out[int(e.th32ProcessID)] = int(e.th32ParentProcessID)
+                    if not _k32.Process32NextW(snap, ctypes.byref(e)):
+                        break
+        finally:
+            _k32.CloseHandle(snap)
+    except Exception as e:
+        log("warn", t("log.win.ppid_fail", e))
+    return out
+
+
+def _collect_tree(root, m):
+    """root 以及它的全部后代 pid。"""
+    out = [root]
+    i = 0
+    while i < len(out):
+        cur = out[i]
+        i += 1
+        for c, p in m.items():
+            if p == cur and c not in out:
+                out.append(c)
+    return out
+
+
+def _ancestor_chain(pid, m):
+    """pid 往上到根的所有祖先。"""
+    out = []
+    for _ in range(32):
+        pp = m.get(pid)
+        if not pp or pp in out or pp <= 4:
+            break
+        out.append(pp)
+        pid = pp
+    return out
+
+
+def ancestor_pids():
+    """自己 + 整条祖先进程链。
+
+    桌宠正常由开机哨兵拉起，MiniMax Code 不会出现在这条链里；但开发 /
+    手工启动时它完全可能被挂在某个 MiniMax Code 底下。那种情况下
+    **绝不能**去杀它，否则连自己这条会话一起送走。
+    """
+    global _ANCESTORS
+    if _ANCESTORS is not None:
+        return _ANCESTORS
+    out = set([os.getpid()])
+    try:
+        m = _pid_parent_map()
+        cur = int(_k32.GetCurrentProcessId())
+        out.add(cur)
+        for _ in range(32):
+            pp = m.get(cur)
+            if not pp or pp in out or pp <= 4:
+                break
+            out.add(pp)
+            cur = pp
+    except Exception as e:
+        log("warn", t("log.win.anc_fail", e))
+    _ANCESTORS = out
+    return out
+
+
+def _process_image(pid):
+    """问系统要某个 pid 的 exe 完整路径；拿不到返回空串。"""
+    if _u32 is None or _k32 is None or not pid:
+        return ""
+    h = None
+    try:
+        _bind_extra()
+        h = _k32.OpenProcess(PROC_QUERY_LIMITED_, False, int(pid))
+        if not h:
+            return ""
+        n = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if _k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+            return buf.value
+    except Exception:
+        pass
+    finally:
+        if h:
+            try:
+                _k32.CloseHandle(h)
+            except Exception:
+                pass
+    return ""
+
+
+def app_exe_path():
+    """MiniMax Code 的可执行文件：先问活着的进程要，再退回常见安装目录。"""
+    cands = []
+    try:
+        for pid in sorted(app_pids()):
+            p = _process_image(pid)
+            if p:
+                cands.append(p)
+    except Exception:
+        pass
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        cands.append(os.path.join(local, "Programs", "MiniMax Code",
+                                  "MiniMax Code.exe"))
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    return cands[0] if cands else ""
+
+
+def spawn_app():
+    """拉起一个新的 MiniMax Code 实例。成功返回启动方式说明，失败返回空串。"""
+    exe = app_exe_path()
+    if exe:
+        try:
+            subprocess.Popen([exe], close_fds=True)
+            log("info", t("log.win.spawned", exe))
+            return exe
+        except Exception as e:
+            log("warn", t("log.win.spawn_exe_fail", e))
+    lnk = os.path.join(os.environ.get("APPDATA") or "", "Microsoft", "Windows",
+                       "Start Menu", "Programs", "MiniMax Code.lnk")
+    try:
+        if os.path.isfile(lnk):
+            os.startfile(lnk)
+            log("info", t("log.win.spawned_lnk"))
+            return lnk
+    except Exception as e:
+        log("warn", t("log.win.lnk_fail", e))
+    return ""
+
+
+def _window_state(hwnd):
+    """窗口现在是「看得见」「最小化」还是「已经被关掉了」。
+
+    这三个状态对应**完全不同的处置**，必须分开：
+
+    · visible   —— 直接置前即可，一个字节的 ShowWindow 都不用发
+    · minimized —— 最小化时渲染进程一定活着，SW_RESTORE 是安全的
+    · hidden    —— **用户已经把窗口关掉了**（含收进托盘 / DWM cloaked）。
+                   这时候 ShowWindow 把它放回来，拿到的是「界面完整、
+                   但消息循环已经不在了」的僵尸 —— 就是那个卡死窗口。
+                   唯一的正解是：结束残留进程，重新拉一个。
+    先判「看不看得见」再判「最小没最小」：顺序反了会踩坑——一个被最小化
+    之后又隐藏的窗口 `IsIconic()` 仍然为真，会被误判成最小化，于是我们
+    对它 SW_RESTORE，又把用户已经关掉的窗口放回屏幕。凡是**看不见**的，
+    一律算「已关闭」。
+    """
+    try:
+        if not _u32.IsWindowVisible(hwnd) or _dwm_cloaked(hwnd):
+            return "hidden"
         if _u32.IsIconic(hwnd):
-            _u32.ShowWindow(hwnd, 9)          # SW_RESTORE
-        else:
-            _u32.ShowWindow(hwnd, 5)          # SW_SHOW
+            return "minimized"
+        return "visible"
+    except Exception:
+        return "visible"
+
+
+def _focus_only(hwnd):
+    """只置前，不发任何 ShowWindow（窗口本来就可见时最安全的一步）。"""
+    try:
         fg = _u32.GetForegroundWindow()
         cur = _k32.GetCurrentThreadId()
         fgt = _u32.GetWindowThreadProcessId(fg, None) if fg else 0
@@ -373,12 +800,276 @@ def activate_app():
         _u32.SetForegroundWindow(hwnd)
         _u32.BringWindowToTop(hwnd)
         _u32.SetActiveWindow(hwnd)
-        _u32.SetFocus(hwnd)
         if fgt and fgt != cur:
             _u32.AttachThreadInput(cur, fgt, False)
-        return True
     except Exception:
         return False
+    for _ in range(6):
+        time.sleep(0.05)
+        fg = _u32.GetForegroundWindow()
+        if fg == hwnd:
+            return True
+    tgt = window_pid(hwnd)
+    return bool(fg and tgt and window_pid(fg) == tgt)
+
+
+def _bring_to_front(hwnd):
+    """置前 + 复核。
+
+    只有**最小化**的窗口才允许 `SW_RESTORE`：最小化时渲染进程一定还活着，
+    还原是安全操作。对一个已经被用户关掉的窗口调 ShowWindow，等于把僵尸
+    重新摆到屏幕上 —— 那就是要修的那个 bug。
+    """
+    try:
+        if _u32.IsIconic(hwnd):
+            _u32.ShowWindow(hwnd, 9)          # SW_RESTORE，仅限最小化窗口
+    except Exception:
+        pass
+    return _focus_only(hwnd)
+
+
+def _pick_from(wins):
+    """在（已经确认活着的）候选窗口里挑最合适的那个。"""
+    for h, title, visible, _a in wins:
+        if visible and APP_TITLE_HINT in title.lower():
+            return h
+    for h, _t, visible, _a in wins:
+        if visible:
+            return h
+    return wins[0][0] if wins else 0
+
+
+def _split_windows(wins, ms=HUNG_PROBE_MS):
+    """把窗口列表劈成「还活着」和「已经僵了」两堆。"""
+    alive, dead = [], []
+    for w in wins[:_MAX_PROBE_WINDOWS]:
+        (alive if window_responsive(w[0], ms) else dead).append(w)
+    return alive, dead
+
+
+def pick_app_window():
+    """挑最适合置前的窗口：**可见的**优先，其次最小化的。
+
+    已经被关掉的窗口不在候选里——复活它只会得到一个点不动的空壳。
+    """
+    try:
+        wins = app_windows()
+    except Exception:
+        return None
+    ok = [w for w in wins if _window_state(w[0]) in ("visible", "minimized")]
+    return _pick_from(ok) or None
+
+
+def _kill_stuck(stuck_windows, guard, alive_windows):
+    """结束掉「关掉了窗口、却还赖着不走」的进程树。
+
+    三道闸，任何一道不过就整棵树放弃：
+      · 该进程在桌宠的祖先链里（可能是拉起桌宠的那家，绝不能杀）；
+      · 该进程树里还有任何**活着 / 开着**的窗口（说不定用户正用着别的窗口）；
+      · 该进程树不在上面两者的**祖先闭包**里（杀父会顺手带走活的）。
+    """
+    m = _pid_parent_map()
+    protect = set(guard)
+
+    def _protect_tree(pid):
+        """保护 pid 这棵子树**以及它所有祖先的子树**。
+
+        只保护后代是不够的：活窗口常在渲染子进程里，残留窗口在它的父进程上，
+        杀父会顺手把活的那个带走。祖先闭包才是真正安全的那一圈。
+        """
+        for r in [pid] + _ancestor_chain(pid, m):
+            protect.update(_collect_tree(r, m))
+
+    for p in list(guard):
+        _protect_tree(p)
+    for h, _t, _v, _a in alive_windows:
+        p = window_pid(h)
+        if p:
+            _protect_tree(p)
+    roots, skipped = [], 0
+    for h, _t, _v, _a in stuck_windows:
+        p = window_pid(h)
+        if not p:
+            continue
+        if p in protect:
+            skipped += 1
+            continue
+        if p not in roots:
+            roots.append(p)
+    targets = []
+    for p in roots:
+        for node_pid in _collect_tree(p, m):
+            if node_pid not in protect and node_pid not in targets:
+                targets.append(node_pid)
+    killed = []
+    for pid in targets:
+        try:
+            h = _k32.OpenProcess(PROC_TERMINATE_ | PROC_SYNCHRONIZE_, False, int(pid))
+            if not h:
+                continue
+            try:
+                if _k32.TerminateProcess(h, 0):
+                    killed.append(pid)
+            finally:
+                _k32.CloseHandle(h)
+        except Exception:
+            pass
+    log("info", t("log.act.killed", len(killed), skipped))
+    if skipped:
+        log("warn", t("log.act.protected", skipped))
+    return killed
+
+
+def _spawn_and_wait(how, note):
+    """发起启动，并等一个新窗口真的冒出来。"""
+    started = spawn_app()
+    if not started:
+        return {"ok": False, "how": "spawn-failed",
+                "note": t("log.act.n_noexe")}
+    deadline = time.time() + RELAUNCH_WAIT_S
+    h = 0
+    while time.time() < deadline:
+        time.sleep(0.4)
+        try:
+            wins = app_windows()
+        except Exception:
+            continue
+        for w in wins[:_MAX_PROBE_WINDOWS]:
+            # 必须真的有窗口「开起来了」。只认 hidden 的话，进程里那个
+            # 关着的旧窗口会冒充成新窗口，召唤会假成功。
+            if _window_state(w[0]) == "hidden":
+                continue
+            if window_responsive(w[0]):
+                h = w[0]
+                break
+        if h:
+            break
+    if not h:
+        fail = "relaunch-failed" if how == "relaunch" else "spawn-failed"
+        return {"ok": False, "how": fail, "note": t("log.act.n_nowin", note)}
+    _bring_to_front(h)
+    return {"ok": True, "how": how, "note": note}
+
+
+def activate_app(allow_kill=True):
+    """把 MiniMax Code 带到前台，返回 {"ok": bool, "how": str, "note": str}。
+
+    allow_kill=False 时不允许结束任何进程（后台还有任务在跑时用）。
+
+    how：focus   置前一个本来就开着 / 只是最小化的窗口
+         spawn   进程活着但一个窗口都没有 → 拉起新实例
+         relaunch 窗口已被关闭但进程还在 → 清掉残留进程后重新拉起
+         show    清不掉残留进程（桌宠的宿主），只能把窗口还原出来
+         spawn-failed / relaunch-failed / probe-error
+    """
+    if _u32 is None:
+        return {"ok": False, "how": "probe-error", "note": t("log.act.n_notwin")}
+    try:
+        return _activate_win(allow_kill)
+    except Exception as e:
+        log("warn", t("log.act.exc", e))
+        return {"ok": False, "how": "probe-error", "note": "%s" % e}
+
+
+def _rebuild_app(hidden_windows, guard, allow_kill):
+    """窗口已经被用户关掉了 —— 不要复活它，结束残留进程、拉一个全新实例。
+
+    「关闭后进程还活着」时把窗口放回来之所以会卡死，是因为那具窗口的渲染
+    进程已经没了，只剩最后一帧像素。而 `SendMessageTimeout(WM_NULL)` 照样
+    查不出来：Chromium 只要消息泵还在就会回 WM_NULL，界面死没死它不知道。
+    所以这条路径**不靠检测，靠策略**——被关掉的窗口一律不复活。
+    """
+    if not allow_kill:
+        # 后台还有任务在跑，结束进程会把任务一起杀掉。那就老实地还原它，
+        # 但要说清楚：这条路上拿到的不一定是活的。
+        h = _pick_from(hidden_windows)
+        if _bring_to_front(h):
+            return {"ok": True, "how": "show",
+                    "note": t("log.act.n_running")}
+        return {"ok": False, "how": "probe-error", "note": t("log.act.n_restore_failed")}
+
+    # 先礼：WM_CLOSE，让 Electron 有机会体面退出并释放单实例锁
+    for h, _t, _v, _a in hidden_windows:
+        try:
+            _bind_extra()
+            _u32.PostMessageW(wintypes.HWND(h), WM_CLOSE_, 0, 0)
+        except Exception:
+            pass
+    log("info", t("log.act.wm_close", len(hidden_windows), "%.1f" % CLOSE_GRACE_S))
+    time.sleep(CLOSE_GRACE_S)
+
+    # 窗口自己回来了？说明它其实还活着，那就置前，别杀。
+    back = []
+    try:
+        back = [w for w in app_windows() if _window_state(w[0]) != "hidden"]
+    except Exception:
+        pass
+    if back:
+        h = _pick_from(back)
+        if _bring_to_front(h):
+            return {"ok": True, "how": "focus",
+                    "note": t("log.act.n_back")}
+
+    try:
+        left = [w for w in app_windows() if _window_state(w[0]) == "hidden"]
+    except Exception:
+        left = list(hidden_windows)
+    if not left:
+        return _spawn_and_wait("spawn", t("log.act.n_gone"))
+
+    killed = _kill_stuck(left, guard, back)
+    if killed:
+        time.sleep(0.8)
+        return _spawn_and_wait(
+            "relaunch", t("log.act.n_cleared", len(killed)))
+    log("warn", t("log.act.cant_kill"))
+    return _spawn_and_wait("spawn", t("log.act.n_protected"))
+
+
+def _activate_win(allow_kill=True):
+    guard = ancestor_pids()
+
+    # ---------- 0. 枚举失败就什么都别做 ----------
+    # app_windows() 内部是 app_pids()，扫描失败会抛。这种时候绝不能
+    # 顺着走进「没窗口 → 拉新实例」分支，那会平白多开一个实例。
+    try:
+        wins = app_windows()
+    except Exception as e:
+        return {"ok": False, "how": "probe-error", "note": t("log.act.n_enum_fail", e)}
+
+    if not wins:
+        return _spawn_and_wait("spawn", "进程还在但没有窗口")
+
+    by_state = {"visible": [], "minimized": [], "hidden": []}
+    for w in wins:
+        by_state[_window_state(w[0])].append(w)
+
+    # ---------- 1. 窗口本来就开着 → 只置前，一个 ShowWindow 都不发 ----------
+    if by_state["visible"]:
+        h = _pick_from(by_state["visible"])
+        if _focus_only(h) or _bring_to_front(h):
+            return {"ok": True, "how": "focus",
+                    "note": t("log.act.n_visible", len(by_state["visible"]))}
+
+    # ---------- 2. 最小化 → SW_RESTORE（渲染进程确定还活着）----------
+    if by_state["minimized"]:
+        h = _pick_from(by_state["minimized"])
+        if _bring_to_front(h):
+            return {"ok": True, "how": "focus",
+                    "note": t("log.act.n_minimized",
+                             len(by_state["minimized"]))}
+
+    # ---------- 3. 只剩「已经被用户关掉」的窗口了 ----------
+    hidden = by_state["hidden"]
+    if not hidden:
+        # 状态判不出来（EnumWindows 到了但分类没落进去）——最后退一步硬置前
+        h = _pick_from(by_state["visible"] + by_state["minimized"])
+        if h and _bring_to_front(h):
+            return {"ok": True, "how": "focus", "note": t("log.act.n_nostate")}
+        return {"ok": False, "how": "probe-error", "note": t("log.act.n_badstate")}
+
+    log("info", t("log.act.closed_windows", len(hidden)))
+    return _rebuild_app(hidden, guard, allow_kill)
 
 
 # ========== 会话转录 → 任务状态（只读）==========
@@ -758,6 +1449,8 @@ class SessionWatcher(QObject):
 # ========== 可选：本地 HTTP 事件入口（便于外部脚本推送 / 演示）==========
 class _Bridge(QObject):
     event_received = pyqtSignal(dict)
+    # 召唤结果回传：探测 / 重拉可能要好几秒，必须走子线程再切回主线程
+    activate_result = pyqtSignal(dict)
 
 
 BRIDGE = _Bridge()
@@ -1518,7 +2211,8 @@ class CardStack(QWidget):
 # ========== 主窗口 ==========
 class PetWindow(QWidget):
     def __init__(self, server=True, tray=True, hotkey=True,
-                 port=DEFAULT_PORT, follow=True, exit_with_app=False):
+                 port=DEFAULT_PORT, follow=True, exit_with_app=False,
+                 follow_mode=FOLLOW_MODE_PROCESS):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1526,6 +2220,8 @@ class PetWindow(QWidget):
         self.setFixedSize(*PET_SIZE)
 
         self.follow = follow
+        self.follow_mode = (follow_mode if follow_mode in FOLLOW_MODES
+                            else FOLLOW_MODE_PROCESS)
         self.exit_with_app = exit_with_app
         self.manual_hidden = False
         self.cards_manual = False
@@ -1535,6 +2231,8 @@ class PetWindow(QWidget):
         self._face_mood = ""
         self._toast = ""
         self._toast_until = 0.0
+        self._watcher_checked = 0.0
+        self._act_busy = False
         self.state = load_state()
 
         self.watcher = SessionWatcher(self)
@@ -1550,8 +2248,20 @@ class PetWindow(QWidget):
         # _check_app 的「连续两次没检测到才判关闭」分支永远不会触发。
         self.app_seen = app_running()
         self.app_miss = 0
+        # 召唤结果统一回到主线程再改 UI —— 子线程里绝对不碰任何控件
+        BRIDGE.activate_result.connect(self._on_activate_result)
         self.app_timer = QTimer(self, timeout=self._check_app, interval=3000)
         self.app_timer.start()
+
+        # 插拔显示器 / 主屏切换 → 重新按新屏幕的 DPR 换算一次。
+        # 这是「拔掉外接显示器桌宠突然变大」的直接修复点。
+        try:
+            _gui = QGuiApplication.instance()
+            _gui.screenAdded.connect(self._on_screens_changed)
+            _gui.screenRemoved.connect(self._on_screens_changed)
+            _gui.primaryScreenChanged.connect(self._on_screens_changed)
+        except Exception:
+            pass
 
         # 可选 HTTP 事件入口
         self.srv = None
@@ -1642,23 +2352,17 @@ class PetWindow(QWidget):
         m.addAction(t("menu.show_pet"), self.toggle_visible)
         m.addAction(t("menu.show_cards"), self.toggle_cards)
         m.addSeparator()
-        a1 = m.addAction(t("menu.follow"))
-        a1.setCheckable(True)
-        a1.setChecked(self.follow)
-        a1.triggered.connect(self._set_follow)
-        a2 = m.addAction(t("menu.exit_with"))
-        a2.setCheckable(True)
-        a2.setChecked(self.exit_with_app)
-        a2.triggered.connect(self._set_exit_with_app)
+        self._add_follow_menu(m)
         m.addSeparator()
         m.addAction(t("menu.jump"), lambda: self.jump_app(None))
         m.addAction(t("menu.demo"), self.run_demo)
+        self._add_size_menu(m)
         m.addAction(t("menu.reset"), self.reset_pos)
         m.addAction(t("menu.opendir"), self._open_dir)
         m.addSeparator()
         self._add_lang_menu(m)
         m.addSeparator()
-        m.addAction(t("menu.quit"), self.quit)
+        m.addAction(t("menu.quit"), lambda: self.quit(reason="user"))
         return m
 
     def _open_dir(self):
@@ -1712,24 +2416,76 @@ class PetWindow(QWidget):
 
     # ---------- 生命周期跟随 ----------
     def _check_app(self):
+        """显隐跟随。
+
+        两个口径分得很清：
+        · 「显示 / 隐藏」跟 **app_foreground()**（窗口在不在）——这才是
+          菜单里那条「跟随 MiniMax Code 开关」承诺的行为；
+        · 「退出」跟 **app_running()**（进程在不在）——只有进程真没了才退出，
+          否则「关掉窗口、后台还留着」会把桌宠也一起带走，多余且吓人。
+
+        manual_hidden 是手动对跟随的**临时覆盖**：手动隐藏后本次不打扰，
+        等应用下次重新打开，跟随重新接管。手动开关**永远不改 follow 开关
+        本身**（以前这里会偷偷把 follow 关掉并写进状态文件，用户只是想让
+        桌宠出来一下，从此就再也不跟随了）。
+        """
         running = app_running()
-        if running:
+        # 「显示 / 隐藏」跟什么由 follow_mode 决定（默认跟进程）；
+        # 「退出」永远只看进程 —— 窗口关了但后台还活着时，桌宠不该跟着自杀。
+        # getattr：_check_app 会被裸对象（没跑过 __init__）直接调用，
+        # 取不到 follow_mode 就退回默认，别把生命周期契约炸掉。
+        mode = getattr(self, "follow_mode", FOLLOW_MODE_PROCESS)
+        fg = (running if mode == FOLLOW_MODE_PROCESS
+              else app_foreground())
+
+        if fg:
             if not self.app_seen:
                 log("lifecycle", t("log.app_seen"))
+                if self.follow and self.manual_hidden:
+                    self.manual_hidden = False
+                    log("info", t("log.follow_resume"))
             self.app_seen = True
             self.app_miss = 0
             if self.follow and not self.manual_hidden and not self.isVisible():
                 self._sync_visibility(True)
         elif self.app_seen:
             self.app_miss += 1
-            if self.app_miss >= 2:            # 连续两次没有才判关闭，避免重启瞬间误判
+            if self.app_miss >= 2:            # 连续两次没有才判关闭，避免闪烁误判
                 log("lifecycle", t("log.app_gone"))
-                if self.exit_with_app:
+                if self.exit_with_app and not running:
                     self.quit()
                 elif self.follow and not self.manual_hidden:
                     self._sync_visibility(False)
                 self.app_seen = False
                 self.app_miss = 0
+        if running:
+            try:
+                self._ensure_watcher()
+            except Exception:
+                pass
+
+    def _ensure_watcher(self):
+        """反向看门：哨兵没了就把它拉回来。
+
+        哨兵管「应用在 → 桌宠必须在」，桌宠管「应用在 → 哨兵必须在」，
+        两者互相保险。除非两个进程在同一瞬间一起被杀，桌面不会再空着。
+        _check_app 每 3 秒调一次，这里再限流到 9 秒一次。
+        """
+        now = time.time()
+        last = getattr(self, "_watcher_checked", 0.0)
+        if now - last < 9.0:
+            return
+        try:
+            self._watcher_checked = now
+        except Exception:
+            pass
+        try:
+            import pet_watcher
+            if not pet_watcher.lock_held_by_other():
+                log("lifecycle", t("log.watcher_restore"))
+                pet_watcher.spawn_watcher()
+        except Exception:
+            pass
 
     def _sync_visibility(self, running):
         if running:
@@ -1747,8 +2503,246 @@ class PetWindow(QWidget):
         self.state["follow"] = self.follow
         save_state(self.state)
         log("info", t("log.follow", self.follow))
-        if self.follow and app_running() and not self.manual_hidden:
+        if self.follow:
+            # 刚打开跟随：解除手动覆盖，并立刻按当前状态重新判一次显隐，
+            # 免得勾了还要等下一个轮询周期。
+            self.manual_hidden = False
+            self.app_seen = False
+            self.app_miss = 0
+            self._check_app()
+        else:
+            # 关掉跟随 = 「桌宠不再由应用支配」，那就先把已经藏起来的它放出来
             self._sync_visibility(True)
+        self._refresh_menus()
+
+    def _set_follow_mode(self, mode):
+        if mode not in FOLLOW_MODES:
+            return
+        self.follow_mode = mode
+        self.state["follow_mode"] = mode
+        save_state(self.state)
+        log("info", t("log.follow_mode", follow_mode_text(mode)))
+        if self.follow:                    # 立刻按新口径重新判一次
+            self.app_seen = False
+            self.app_miss = 0
+            self._check_app()
+        self._refresh_menus()
+
+    def _refresh_menus(self):
+        """开关变了就重建托盘菜单，否则勾选状态会一直停在旧值上。"""
+        if self.tray:
+            try:
+                self.tray.setContextMenu(self._build_menu())
+            except Exception:
+                pass
+
+    def _add_follow_menu(self, m):
+        """跟随相关的菜单项。托盘和右键共用，别再各写一份。"""
+        a1 = m.addAction(t("menu.follow"))
+        a1.setCheckable(True)
+        a1.setChecked(self.follow)
+        a1.triggered.connect(self._set_follow)
+        sub = m.addMenu(t("follow.mode_menu"))
+        group = QActionGroup(sub)
+        group.setExclusive(True)
+        for mode in FOLLOW_MODES:
+            a = sub.addAction(follow_mode_text(mode))
+            a.setCheckable(True)
+            a.setChecked(self.follow_mode == mode)
+            a.triggered.connect(
+                lambda _c=False, m_=mode: self._set_follow_mode(m_))
+            group.addAction(a)
+        a2 = m.addAction(t("menu.exit_with"))
+        a2.setCheckable(True)
+        a2.setChecked(self.exit_with_app)
+        a2.triggered.connect(self._set_exit_with_app)
+        return m
+
+    # ---------- 尺寸：物理像素锚定 + 档位 ----------
+    def _current_dpr(self):
+        """桌宠**当前所在**屏幕的 Qt DPR；取不到就用主屏；再取不到用 1.0。
+
+        顺带把屏幕名缓存下来给 HTTP 诊断用（那个 handler 在子线程上，
+        不能自己去问 Qt）。注意这只是**初值**，最终以 _measure_scale()
+        的实测为准。
+        """
+        global _SCREEN_NAME
+        try:
+            scr = QGuiApplication.screenAt(self.geometry().center())
+            if scr is None:
+                scr = QGuiApplication.primaryScreen()
+            if scr is not None:
+                _SCREEN_NAME = scr.name()
+                return float(scr.devicePixelRatio())
+        except Exception:
+            pass
+        return 1.0
+
+    def _measure_scale(self):
+        """用 Win32 量一次「逻辑像素 → 物理像素」的真实比例。
+
+        为什么要有实测这一步：尺子本身也可能是错的。Qt 的 devicePixelRatio
+        在多屏混合缩放、DPI 虚拟化等组合下未必等于窗口实际被放大的倍数，
+        而拿一个 DPI-unaware 的进程去量还会再被虚拟化一次（量出来会小 1.5 倍，
+        本机就踩过这个坑，一度以为 Qt 报错了）。
+        量高度而不是宽度——_fit_width() 会按状态胶囊文字动态改宽度，
+        用宽度量会被文字长度污染。
+        """
+        global _PX_FACTOR
+        if sys.platform != "win32" or _u32 is None or _k32 is None:
+            return None
+        try:
+            hwnd = wintypes.HWND(int(self.winId()))
+            rect = wintypes.RECT()
+            if not _u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+            phys_h = float(rect.bottom - rect.top)
+            log_h = max(1.0, float(self.height()))
+            k = phys_h / log_h
+            if 0.25 < k < 8.0:
+                _PX_FACTOR = k
+                return k
+        except Exception as e:
+            log("info", t("log.size.measure_fail", e))
+        return None
+
+    def _apply_size(self, force=False, measure=False):
+        """把当前比例 + 档位落到窗口、团子、胶囊和卡片上。
+
+        measure=True 时先按现有比例应用，再实测一次真实比例，不一致就改用
+        实测值重算——这样启动和换屏都能自动收敛到正确的物理大小。
+        """
+        if measure:
+            self._apply_size_once(force=force)
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+            before = _scale()
+            k = self._measure_scale()
+            if k and abs(k - before) > 0.02:
+                self._apply_size_once(force=True)
+                log("info", t("log.size.remeasured", "%.3f" % k, "%.2f" % _dpr()))
+            return
+        self._apply_size_once(force=force)
+
+    def _apply_size_once(self, force=False):
+        new = recalc_pet_size()
+        old_w, old_h = self.width(), self.height()
+        try:
+            self.face.setFixedSize(BODY_W, BODY_H)
+            self.chip.setFixedHeight(CHIP_H)
+            self.setFixedSize(*PET_SIZE)
+            if getattr(self, "_inner_layout", None) is not None:
+                self._inner_layout.setContentsMargins(
+                    (PET_SIZE[0] - BODY_W) // 2, 0, 0, 0)
+            self.cards.setFixedWidth(_px(CARD_W))
+        except Exception as e:
+            log("info", t("log.size.apply_fail", e))
+            return
+        # 窗口变大时保持团子在屏幕上的位置不动（以中心为锚）
+        if (old_w, old_h) != new and not force:
+            try:
+                c = self.geometry().center()
+                self.move(c.x() - new[0] // 2, c.y() - new[1] // 2)
+            except Exception:
+                pass
+        self._clamp_pos()
+        try:
+            self.cards.reposition(self)
+        except Exception:
+            pass
+
+    def _sync_size_to_screen(self, force=False, quiet=False):
+        """按桌宠所在屏幕重新换算尺寸。"""
+        dpr = self._current_dpr()
+        global _SCREEN_DPR, _PX_FACTOR
+        _PX_FACTOR = None          # 换屏了，之前实测的比例作废
+        _SCREEN_DPR = dpr
+        self._apply_size(measure=True)
+        if not quiet:
+            # 明细串做成语言中性的（DPR / scale / logical / physical），
+            # 前后缀走 i18n —— 词表里每个 key 最多两个占位符。
+            log("info", t("log.size.sync",
+                          "DPR %.2f / scale %.3f / logical %s / physical %dx%d"
+                          % (dpr, _scale(), "%dx%d" % PET_SIZE,
+                             round(PET_SIZE[0] * _scale()),
+                             round(PET_SIZE[1] * _scale()))))
+        return True
+
+    def _on_screens_changed(self, *_):
+        """插拔显示器 / 主屏切换。延迟一点，等 Qt 自己把 screen 列表更新完。"""
+        QTimer.singleShot(200, self._guard_sync_size)
+
+    def _guard_sync_size(self):
+        """换屏回调的外壳。
+
+        这个回调是 Qt 信号连过来的，一旦抛异常，PyQt5 会直接 abort()，
+        桌宠当场崩掉——而且崩点在用户插拔显示器的瞬间，最难复现也最难查。
+        所以这里必须兜住，落盘之后继续跑。
+        """
+        try:
+            self._sync_size_to_screen()
+        except Exception:
+            try:
+                import traceback
+                log("info", t("log.size.sync_fail", traceback.format_exc()))
+            except Exception:
+                pass
+
+    def set_size_level(self, level):
+        """右键菜单改大小。档位写进 pet_state.json，重启后保持。"""
+        global SIZE_LEVEL
+        try:
+            level = round(float(level), 2)
+        except Exception:
+            return
+        if level not in SIZE_LEVELS:
+            return
+        if abs(level - SIZE_LEVEL) < 0.001:
+            return
+        SIZE_LEVEL = level
+        self.state["size_level"] = level
+        save_state(self.state)
+        self._apply_size()
+        self.update()
+        log("info", t("log.size.level", size_level_name(level), "%.2f" % level))
+
+    def _add_size_menu(self, menu):
+        """把「大小」子菜单挂到任意 QMenu 上（托盘菜单和右键菜单共用）。"""
+        sm = menu.addMenu(t("size.menu"))
+        for lv in SIZE_LEVELS:
+            cur = abs(self.state.get("size_level", SIZE_LEVEL) - lv) < 0.01
+            act = sm.addAction(size_level_name(lv))
+            act.setCheckable(True)
+            act.setChecked(cur)
+            act.triggered.connect(
+                lambda _checked=False, v=lv: self.set_size_level(v))
+        sm.addSeparator()
+        sm.addAction(t("size.recalibrate"),
+                     lambda: self._sync_size_to_screen(force=True))
+        sm.addAction(t("size.show_info"), self._show_size_info)
+        return sm
+
+    def _show_size_info(self):
+        scr = None
+        try:
+            scr = QGuiApplication.screenAt(self.geometry().center())
+        except Exception:
+            pass
+        name = scr.name() if scr is not None else t("screen.unknown")
+        k = _scale()
+        detail = ("DPR %.2f / scale %.3f / level %.2f (%s)"
+                  " / logical %d x %d / physical %d x %d"
+                  % (_dpr(), k, SIZE_LEVEL, size_level_name(SIZE_LEVEL),
+                     PET_SIZE[0], PET_SIZE[1],
+                     round(PET_SIZE[0] * k), round(PET_SIZE[1] * k)))
+        msg = t("size.info", name + chr(10) + detail)
+        try:
+            self._toast_msg(msg, 6.0)
+        except Exception:
+            pass
+        log("info", msg)
 
     def _set_lang(self, lang):
         """切换界面语言：立刻重写窗口标题、菜单、卡片并写回 pet_state.json。
@@ -1776,24 +2770,29 @@ class PetWindow(QWidget):
         self.state["exit_with_app"] = self.exit_with_app
         save_state(self.state)
 
-    # ---------- 显示开关 ----------
+    # ---------- 显示开关（手动）----------
     def toggle_visible(self):
+        """手动显示 / 隐藏。
+
+        **绝不改 follow 开关。** 跟随和手动是两个正交的维度：跟随管「应用
+        开/关那一刻的自动显隐」，手动管「用户当下想看还是不想看」。以前这里
+        在手动显示时把 follow 静默改成 False 并落盘，用户只是想唤出桌宠，
+        结果从此再也不跟随了 —— 而且没有任何提示，属于典型的静默副作用。
+        """
         if self.isVisible():
             self.manual_hidden = True
             self.hide()
             if self.cards.isVisible():
                 self.cards.hide()
             log("info", t("log.hide_manual"))
+            self._toast_msg(
+                t("toast.hidden_follow") if self.follow else t("toast.hidden"),
+                2.0)
         else:
             self.manual_hidden = False
-            if self.follow:                   # 手动接管后不再被生命周期覆盖
-                self.follow = False
-                self.state["follow"] = False
-                save_state(self.state)
-                if self.tray:
-                    self.tray.setContextMenu(self._build_menu())
             self._sync_visibility(True)
             log("info", t("log.show_manual"))
+            self._toast_msg(t("toast.shown"), 1.5)
 
     def toggle_cards(self):
         if self.cards.isVisible():
@@ -1849,18 +2848,16 @@ class PetWindow(QWidget):
         m.addAction(t("menu.fold_cards", n_hidden) if self.cards.expanded
                     else t("menu.expand_cards", self.cards.total()),
                     self._on_cards_toggle)
-        a1 = m.addAction(t("menu.follow"))
-        a1.setCheckable(True)
-        a1.setChecked(self.follow)
-        a1.triggered.connect(self._set_follow)
+        self._add_follow_menu(m)
         m.addSeparator()
         m.addAction(t("menu.jump"), lambda: self.jump_app(None))
         m.addAction(t("menu.demo"), self.run_demo)
+        self._add_size_menu(m)
         m.addAction(t("menu.reset"), self.reset_pos)
         m.addSeparator()
         self._add_lang_menu(m)
         m.addSeparator()
-        m.addAction(t("menu.quit"), self.quit)
+        m.addAction(t("menu.quit"), lambda: self.quit(reason="user"))
         m.exec_(e.globalPos())
 
     # ---------- 数据 → 显示 ----------
@@ -1980,8 +2977,57 @@ class PetWindow(QWidget):
         self._clamp_pos()
 
     # ---------- 跳转 ----------
+    # ---------- 跳转 ----------
+    _ACT_TIPS = {
+        "focus": "act.focus",
+        "show": "act.show",
+        "spawn": "act.spawn",
+        "relaunch": "act.relaunch",
+        "spawn-failed": "act.spawn_failed",
+        "relaunch-failed": "act.relaunch_failed",
+        "probe-error": "act.probe_error",
+    }
+
     def jump_app(self, key):
-        ok = activate_app()
+        """召唤 MiniMax Code。
+
+        整个过程丢给子线程：里面要探窗口状态、等残留进程体面退出、
+        再等新窗口冒头，最坏十几秒。放在 Qt 主线程里做这些，桌宠自己先冻住
+        ——那才是字面意义上的界面卡死。
+        """
+        if self._act_busy:
+            self._toast_msg(t("toast.jump_busy"), 1.5)
+            return
+        self._act_busy = True
+        self._toast_msg(t("toast.jumping"), 2.5)
+        # 后台还有任务在跑的话不能结束进程 —— 会把任务一起杀掉
+        allow_kill = self.watcher.count_active() == 0
+        if not allow_kill:
+            log("info", t("log.jump_keep_proc"))
+        log("info", t("log.jump_start", allow_kill))
+
+        def _work():
+            try:
+                res = activate_app(allow_kill)
+            except Exception as e:            # 兜底：绝不让子线程静默死掉
+                res = {"ok": False, "how": "probe-error", "note": "%s" % e}
+            if not isinstance(res, dict):     # 兼容任何还在返回 bool 的老实现
+                res = {"ok": bool(res), "how": "focus", "note": ""}
+            res["key"] = key
+            try:
+                BRIDGE.activate_result.emit(res)
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_activate_result(self, res):
+        """召唤结束（主线程）。收卡 / 提示 / 刷新都放这里。"""
+        self._act_busy = False
+        ok = bool(res.get("ok"))
+        how = str(res.get("how") or "")
+        note = str(res.get("note") or "")
+        key = res.get("key")
         if not key:
             # 点的是团子本身：顺手把「已经跑完」的那个任务也收掉，让团子立刻
             # 切到下一个任务或回到待命，不留在旧任务的完成态上。
@@ -1998,8 +3044,12 @@ class PetWindow(QWidget):
             elif s and not s.get("acked"):
                 s["acked"] = True
                 log("info", t("log.card_dismissed", key[:24]))
-        log("info", t("log.jump_ok") if ok else t("log.jump_fail"))
-        self._toast_msg(t("toast.jumped") if ok else t("toast.no_window"), 2.0)
+        log("info", t("log.jump_result",
+                    ("%s [%s]" % ("✓" if ok else "✗", how)), note))
+        tip_key = self._ACT_TIPS.get(how)
+        if not tip_key:
+            tip_key = "act.focus" if ok else "act.probe_error"
+        self._toast_msg(t(tip_key), 3.0)
         self.refresh(force=True)
         if not self.cards.count():
             self.cards.hide()
@@ -2063,7 +3113,24 @@ class PetWindow(QWidget):
         self.refresh(force=True)
 
     # ---------- 退出 ----------
-    def quit(self):
+    def quit(self, reason="exit"):
+        """reason=user 表示「用户主动从托盘/右键退出」。
+
+        这时必须留个痕迹，否则看门狗哨兵会以为桌宠是意外掉的，隔几秒又把它
+        拉起来——用户点「退出」结果永远退不掉。
+
+        痕迹的**对称解除口**有两个，都不需要命令行知识：
+          · 双击 scripts/run_pet.bat（内部就是 --resume）
+          · 重新登录（登录启动项会拉起哨兵）
+        所以应用被重新打开时**不再**自动清这个痕迹，否则「手动关闭」会被
+        应用重开无声推翻。
+        """
+        if reason == "user":
+            try:
+                import pet_watcher
+                pet_watcher.set_pause()
+            except Exception:
+                pass
         self._save_pos()
         if self.srv:
             self.srv.stop()
@@ -2239,6 +3306,63 @@ def run_selftest(scale=1.0, live=False):
     return 0
 
 
+def run_activate_probe():
+    """Print every step of the "summon MiniMax Code" pipeline and exit.
+
+    Developer diagnostic, so the output is plain English on purpose — it is
+    not part of the localised UI surface and does not need i18n keys.
+
+    The desktop app is the host of the agent session, so the real
+    "close the app -> summon it" path cannot be reproduced from inside the
+    app itself. This probe exists so that path can be inspected from the
+    outside.
+    """
+    print("=== MiniMax Code summon pipeline ===")
+    try:
+        pids = sorted(app_pids())
+    except Exception as e:
+        print("process scan failed: %s" % e)
+        return 1
+    print("processes: %d %s" % (len(pids), pids))
+    guard = ancestor_pids()
+    print("pet + ancestor pids: %s" % sorted(guard))
+    print("  -> MiniMax Code pids inside that chain: %s"
+          % sorted(set(pids) & guard))
+    print("executable: %s" % (app_exe_path() or "(not found)"))
+
+    try:
+        wins = app_windows()
+    except Exception as e:
+        print("window enumeration failed: %s" % e)
+        return 1
+    counts = {"visible": 0, "minimized": 0, "hidden": 0}
+    print("top-level windows: %d" % len(wins))
+    for h, title, visible, area in wins:
+        st = _window_state(h)
+        counts[st] = counts.get(st, 0) + 1
+        print("   hwnd=%-9d state=%-9s responsive=%-5s area=%-9d %r"
+              % (h, st, window_responsive(h, 600), area, title[:44]))
+    print("visible %d / minimised %d / closed %d"
+          % (counts["visible"], counts["minimized"], counts["hidden"]))
+    if counts["hidden"]:
+        print("-> closed windows are NOT revived; the app is relaunched "
+              "instead (unless they belong to a protected process).")
+        for w in wins:
+            if _window_state(w[0]) == "hidden":
+                p = window_pid(w[0])
+                print("   leftover window pid=%s%s"
+                      % (p, " **protected (pet ancestor) - left alone**"
+                         if p in guard else ""))
+
+    t0 = time.time()
+    res = activate_app()
+    print("activate_app() -> %s  (%.2fs)"
+          % (json.dumps(res, ensure_ascii=False), time.time() - t0))
+    print("ui tip: %s" % PetWindow._ACT_TIPS.get(res.get("how"), "?"))
+    print("PROBE_ACTIVATE_OK")
+    return 0
+
+
 # ========== 入口 ==========
 def main():
     ap = argparse.ArgumentParser(
@@ -2266,11 +3390,31 @@ def main():
                          " / show at launch regardless of the app")
     ap.add_argument("--no-server", action="store_true",
                     help="不开启本地 HTTP 事件入口 / disable the local HTTP event API")
+    ap.add_argument("--resume", action="store_true",
+                    help="手动重新启用桌宠：先清掉「用户退出」的暂停标记再启动"
+                         " / clear the 'user quit' pause flag, then start")
+    ap.add_argument("--probe-activate", action="store_true",
+                    help="只跑一遍「召唤 MiniMax Code」链路并打印每一步后退出"
+                         " / print the summon pipeline step by step, then exit")
     a = ap.parse_args()
 
     st = load_state()
     # 语言优先级：命令行 > 上次选择 > 系统语言
     set_lang(a.lang or st.get("lang") or system_lang())
+
+    if a.resume:
+        # 「手动关闭」的对称面必须好找：桌宠退出后托盘也没了，用户手上
+        # 唯一能点到的入口就是这个参数（scripts/run_pet.bat 传的就是它）。
+        try:
+            import pet_watcher
+            was = pet_watcher.pause_remaining()
+            pet_watcher.clear_pause()
+            log("info", t("log.resume", was))
+        except Exception as e:
+            log("warn", t("log.resume_fail", e))
+
+    if a.probe_activate:
+        sys.exit(run_activate_probe())
 
     if a.selftest:
         sys.exit(run_selftest(a.selftest_scale, a.selftest_live))
@@ -2291,14 +3435,42 @@ def main():
     # 「MiniMax Code 退出 → 桌宠退出」默认开启，这才是同生共死。
     # pet_watcher 拉起时还会显式再传一次 --exit-with-app 兜底。
     exit_with = a.exit_with_app or st.get("exit_with_app", True) is not False
+    # 「跟随」跟进程还是跟窗口：默认跟进程（关掉窗口、后台 agent 继续跑时
+    # 桌宠也继续显示）。写坏了的值一律退回默认。
+    fm = st.get("follow_mode", FOLLOW_MODE_PROCESS)
+    follow_mode = fm if fm in FOLLOW_MODES else FOLLOW_MODE_PROCESS
+    # ---- 大小：先把档位和「起始屏幕的 DPR」定下来再建控件 ----
+    # 必须在 PetWindow 之前算好，因为控件在构造里就 setFixedSize 了。
+    global SIZE_LEVEL, _SCREEN_DPR, _SCREEN_NAME
+    lv = st.get("size_level")
+    if lv is not None:
+        try:
+            lv = round(float(lv), 2)
+            if lv in SIZE_LEVELS:
+                SIZE_LEVEL = lv
+        except Exception:
+            pass
+    try:
+        _scr0 = QGuiApplication.primaryScreen()
+        if _scr0 is not None:
+            _SCREEN_DPR = float(_scr0.devicePixelRatio())
+            _SCREEN_NAME = _scr0.name()
+    except Exception:
+        pass
     pet = PetWindow(server=not a.no_server, tray=True, hotkey=True, port=a.port,
-                    follow=follow, exit_with_app=exit_with)
-    # 默认不立刻显示：只有 MiniMax Code 真的开着才亮出来。
-    # 否则手动启动时桌宠会先闪一下再自己藏起来，很怪。
-    # --demo / --always-show 是显式要求看它，强制显示。
-    show_now = a.always_show or a.demo or (not follow) or app_running()
+                    follow=follow, exit_with_app=exit_with,
+                    follow_mode=follow_mode)
+    # 起始可见性必须跟 _check_app 用**同一个口径**，否则会出现「先闪一下
+    # 再自己藏起来」。按进程模式下只要进程在就显示——窗口关着也算开着。
+    show_now = (a.always_show or a.demo or not follow
+                or (app_running() if follow_mode == FOLLOW_MODE_PROCESS
+                    else app_foreground()))
     if show_now:
         pet.show()
+    # 位置是构造时才恢复的，真实所在屏幕这会儿才知道；而且 Qt 报的 DPR
+    # 在部分缩放组合下不可信，所以窗口出来后再实测一次缩放并收敛到
+    # 正确的**物理**大小。这是「拔掉显示器桌宠突然变大」的根治点。
+    pet._apply_size(measure=True)
     if a.demo:
         QTimer.singleShot(700, pet.run_demo)
     log("info", t("log.lang", get_lang()))
