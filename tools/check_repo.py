@@ -39,6 +39,7 @@ REQUIRED = [
 # must NOT be committed
 FORBIDDEN = [
     "pet_state.json", "pet.log", "watcher.log", ".watcher.lock",
+      "pet_paused.flag",
     ".env", "id_rsa", "id_ed25519",
 ]
 
