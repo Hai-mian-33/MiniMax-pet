@@ -45,7 +45,18 @@ except Exception:
 BASE = os.path.dirname(os.path.abspath(__file__))
 PET = os.path.join(BASE, "minimax_pet.py")
 WATCHER = os.path.join(BASE, "pet_watcher.py")
-STATE_PATH = os.path.join(BASE, "pet_state.json")
+# ---- 运行时状态目录：固定在 MiniMax Code 自己的配置目录下 -------------
+# 跟代码目录无关（详见 minimax_pet.py 里的同一段说明）：配置落在
+# %USERPROFILE%\.minimax\MiniMaxPet\，代码目录可以随时删。
+# 需要放到别处时用环境变量 MINIMAX_PET_HOME 覆盖。
+_STATE_HOME = os.environ.get("MINIMAX_PET_HOME") or os.path.join(
+    os.path.expanduser("~"), ".minimax", "MiniMaxPet")
+try:
+    os.makedirs(_STATE_HOME, exist_ok=True)
+except Exception:
+    pass
+STATE_PATH = os.path.join(_STATE_HOME, "pet_state.json")
+PAUSE_PATH = os.path.join(_STATE_HOME, "pet_paused.flag")
 STARTUP = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                        "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
 VBS = os.path.join(STARTUP, "MiniMaxPet.vbs")
@@ -195,9 +206,8 @@ def _watcher_running():
 
 def _pause_left():
     """「用户手动退出过桌宠」的剩余秒数；没在暂停返回 0。"""
-    p = os.path.join(BASE, "pet_paused.flag")
     try:
-        with open(p, "r", encoding="utf-8-sig") as f:
+        with open(PAUSE_PATH, "r", encoding="utf-8-sig") as f:
             ts = float(f.read().strip() or 0)
         left = ts - time.time()
         return int(left) if 0 < left <= 3 * 24 * 3600 else 0

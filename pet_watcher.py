@@ -46,13 +46,24 @@ except Exception:
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PET = os.path.join(BASE, "minimax_pet.py")
-LOG_PATH = os.path.join(BASE, "watcher.log")
-LOCK_PATH = os.path.join(BASE, ".watcher.lock")
-STATE_PATH = os.path.join(BASE, "pet_state.json")
+# ---- 运行时状态目录：固定在 MiniMax Code 自己的配置目录下 -------------
+# 跟代码目录无关（详见 minimax_pet.py 里的同一段说明）：配置落在
+# %USERPROFILE%\.minimax\MiniMaxPet\，代码目录可以随时删。
+# 需要放到别处时用环境变量 MINIMAX_PET_HOME 覆盖。
+_STATE_HOME = os.environ.get("MINIMAX_PET_HOME") or os.path.join(
+    os.path.expanduser("~"), ".minimax", "MiniMaxPet")
+try:
+    os.makedirs(_STATE_HOME, exist_ok=True)
+except Exception:
+    pass
+LOG_PATH = os.path.join(_STATE_HOME, "watcher.log")
+LOCK_PATH = os.path.join(_STATE_HOME, ".watcher.lock")
+STATE_PATH = os.path.join(_STATE_HOME, "pet_state.json")
+PAUSE_PATH = os.path.join(_STATE_HOME, "pet_paused.flag")
 # 桌宠自己的单实例锁（QLockFile），用来判断「桌宠还在不在」
 PET_LOCK_PATH = os.path.join(tempfile.gettempdir(), "minimax-pet.lock")
 # 用户主动「退出桌宠」的暂停标记
-PAUSE_PATH = os.path.join(BASE, "pet_paused.flag")
+
 
 POLL_SEC = 1.5
 APP_PROCESS_HINT = "minimax code"

@@ -70,8 +70,21 @@ MASCOT_PATH = os.path.join(ASSETS, "mascot.png")
 MASCOT_TRAY_PATH = os.path.join(ASSETS, "mascot_tray.png")
 MASCOT_SHADOW_PATH = os.path.join(ASSETS, "mascot_shadow.png")
 MASCOT_GLOW_PATH = os.path.join(ASSETS, "mascot_glow.png")
-STATE_PATH = os.path.join(BASE, "pet_state.json")
-LOG_PATH = os.path.join(BASE, "pet.log")
+# ---- 运行时状态目录：固定在 MiniMax Code 自己的配置目录下 -------------
+# 不跟着代码走：不管代码克隆到哪儿、从哪儿双击运行，配置都落在
+# %USERPROFILE%\.minimax\MiniMaxPet\ —— 也就是 MiniMax Code 自己的配置目录
+# （和 config.yaml、v2\ 同级）。这样代码目录随时可以删、随时可以重新 clone，
+# 桌宠的位置 / 大小档位 / 跟随开关都不会丢，仓库里也不会被
+# pet.log / pet_state.json 污染。
+# 需要放到别处时用环境变量 MINIMAX_PET_HOME 覆盖。
+_STATE_HOME = os.environ.get("MINIMAX_PET_HOME") or os.path.join(
+    os.path.expanduser("~"), ".minimax", "MiniMaxPet")
+try:
+    os.makedirs(_STATE_HOME, exist_ok=True)
+except Exception:
+    pass
+STATE_PATH = os.path.join(_STATE_HOME, "pet_state.json")
+LOG_PATH = os.path.join(_STATE_HOME, "pet.log")
 
 # MiniMax Code 的会话转录根目录（只读）
 SESSIONS_ROOT = os.path.join(os.path.expanduser("~"), ".minimax", "v2", "sessions")
