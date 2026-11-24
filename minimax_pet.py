@@ -1544,6 +1544,8 @@ class RemoteWatcher(QObject):
         with self._lock:
             self._hosts = hosts
         self._drop_clients()
+        _REMOTE_INFO["hosts"] = list(hosts)
+        _REMOTE_INFO["status"] = ""
         log("info", t("log.remote_set", ", ".join(hosts) if hosts
                       else t("log.remote_none")))
         if hosts and not self._thread:
@@ -1614,8 +1616,10 @@ class RemoteWatcher(QObject):
         items = client.poll(offsets)
         if items is None:
             self._last_error[host] = client.error or t("log.remote_unreachable")
+            _REMOTE_INFO["status"] = "%s: %s" % (host, self._last_error[host])
             return
         self._last_error.pop(host, None)
+        _REMOTE_INFO["status"] = "%s: ok" % host
         now = time.time()
         seen = set()
         touched = False
@@ -1659,6 +1663,7 @@ class RemoteWatcher(QObject):
                     self._sess.pop(key, None)
                     touched = True
         if touched:
+            _REMOTE_INFO["sessions"] = len(self.snapshot())
             self.changed.emit()
 
     # ---------- 给主线程的快照 ----------
@@ -1673,6 +1678,12 @@ class RemoteWatcher(QObject):
 
 
 # ========== 可选：本地 HTTP 事件入口（便于外部脚本推送 / 演示）==========
+# 远端（SSH）会话的运行状态。HTTP handler 跑在子线程上，只能读普通变量，
+# 所以这里用一个模块级的 dict 让「桌宠到底连上了哪几台、看到几个会话」能被
+# GET / 直接问出来 —— 排查远端问题时非常省事。
+_REMOTE_INFO = {"hosts": [], "sessions": 0, "status": ""}
+
+
 class _Bridge(QObject):
     event_received = pyqtSignal(dict)
     # 召唤结果回传：探测 / 重拉可能要好几秒，必须走子线程再切回主线程
@@ -1706,7 +1717,12 @@ class _EventHandler(BaseHTTPRequestHandler):
         BRIDGE.event_received.emit(payload)
 
     def do_GET(self):
-        body = ("MiniMax Pet ok  app_running=%s\n" % app_running()).encode("utf-8")
+        body = ("MiniMax Pet ok  app_running=%s\n"
+                "remote_hosts=%s  remote_sessions=%d  remote_status=%s\n"
+                % (app_running(),
+                   ",".join(_REMOTE_INFO["hosts"]) or "-",
+                   _REMOTE_INFO["sessions"],
+                   _REMOTE_INFO["status"] or "-")).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
