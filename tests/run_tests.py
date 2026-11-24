@@ -557,6 +557,153 @@ class TestNoHardcodedUI(unittest.TestCase):
                 + "\n  ".join(offenders) + "\n")
 
 
+class TestRemote(unittest.TestCase):
+    """远端（SSH）会话：传输协议、字节偏移、状态合并。
+
+    全部离线：不连任何服务器。远端那一半的脚本在本地跑，喂一个假的
+    会话目录进去，看它吐出来的东西对不对。
+    """
+
+    def _fake_session(self, root, name="15-43-01-380-session_x", project="/home/shm/proj"):
+        d = os.path.join(root, "2026", "11", "24", name)
+        os.makedirs(d, exist_ok=True)
+        msg = {"message": {"role": "user",
+                           "content": [{"type": "text", "text": "hello"}],
+                           "timestamp": 1700000000000}}
+        with open(os.path.join(d, "messages.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(msg) + "\n")
+        with open(os.path.join(d, "llm-call.json"), "w", encoding="utf-8") as f:
+            json.dump({"systemPrompt":
+                       "Primary working directory: " + project}, f)
+        return d
+
+    def test_hosts_roundtrip(self):
+        import remote_watcher
+        tmp = tempfile.mkdtemp()
+        self.assertEqual([], remote_watcher.load_hosts(tmp))
+        remote_watcher.save_hosts(tmp, ["bbnc", "other"])
+        self.assertEqual(["bbnc", "other"], remote_watcher.load_hosts(tmp))
+
+    def test_ssh_aliases_parsed(self):
+        import remote_watcher
+        tmp = tempfile.mkdtemp()
+        cfg = os.path.join(tmp, "config")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("Host bbnc\n  HostName 1.2.3.4\n"
+                    "Host other\n  HostName 5.6.7.8\n"
+                    "Host *\n  ServerAliveInterval 20\n")
+        old = os.path.expanduser("~/.ssh/config")
+        backup = None
+        if os.path.exists(old):
+            backup = old + ".bak-test"
+            os.rename(old, backup)
+        try:
+            os.makedirs(os.path.expanduser("~/.ssh"), exist_ok=True)
+            os.replace(cfg, old)
+            al = remote_watcher.ssh_config_aliases()
+        finally:
+            if os.path.exists(old):
+                os.remove(old)
+            if backup:
+                os.rename(backup, old)
+        self.assertIn("bbnc", al)
+        self.assertIn("other", al)
+        self.assertNotIn("*", al)
+
+    def test_remote_script_scan(self):
+        """远端脚本在本地跑：能找到会话、读出项目名、按偏移只给增量。"""
+        import remote_watcher
+        root = tempfile.mkdtemp()
+        d = self._fake_session(root)
+        old = os.environ.get("MINIMAX_SESSIONS_ROOT")
+        os.environ["MINIMAX_SESSIONS_ROOT"] = root
+        try:
+            # 脚本末尾是「for line in sys.stdin」的死循环，测试里替换成空循环，
+            # 只借它的 scan() 函数。
+            src = remote_watcher.REMOTE_SCRIPT.replace(
+                "for line in sys.stdin:", "for line in []:")
+            ns = {}
+            exec(compile(src, "<remote-script>", "exec"), ns)
+            items = ns["scan"]({})
+        finally:
+            if old is None:
+                os.environ.pop("MINIMAX_SESSIONS_ROOT", None)
+            else:
+                os.environ["MINIMAX_SESSIONS_ROOT"] = old
+        self.assertEqual(1, len(items))
+        it = items[0]
+        self.assertEqual(d, it["path"])
+        self.assertEqual("proj", it["project"])
+        self.assertTrue(it["size"] > 0)
+        self.assertEqual(0, it["start"])
+        raw = __import__("base64").b64decode(it["data"])
+        self.assertIn(b"hello", raw)
+        # 带偏移再扫一次 -> 不该重复给同样的字节
+        items2 = ns["scan"]({d: it["size"]})
+        self.assertEqual(1, len(items2))
+        self.assertEqual(0, len(__import__("base64").b64decode(items2[0]["data"])))
+
+    def test_remote_sessions_merge_into_watcher(self):
+        """远端会话要能混进本机的 visible_sessions / active / count_active。"""
+        try:
+            import PyQt5  # noqa: F401
+        except ImportError:
+            self.skipTest("PyQt5 not installed")
+        import minimax_pet as mp
+        import remote_watcher
+
+        class _FakeHost(object):
+            def __init__(self, name):
+                self.name = name
+                self.alive = True
+                self.error = ""
+
+            def poll(self, offsets):
+                if offsets:
+                    return []
+                # 真实的 messages.jsonl 每行都带换行；少了换行，最后一行会被
+                # 当成「还没写完的半行」扣住（本地 watcher 也是这个规矩）。
+                # 时间戳要用**当前**时间：太旧的话 _settle_state 会把会话判成
+                # 「已完成」，那就不是 active 状态了。
+                data = (json.dumps({
+                    "message": {"role": "user",
+                                "content": [{"type": "text", "text": "远端任务"}],
+                                "timestamp": int(time.time() * 1000)}}) + "\n"
+                           ).encode("utf-8")
+                return [{"path": "/remote/sess", "size": len(data), "start": 0,
+                         "data": __import__("base64").b64encode(data).decode(),
+                         "project": "remote-proj"}]
+
+            def close(self):
+                pass
+
+        old_host = remote_watcher.RemoteHost
+        remote_watcher.RemoteHost = _FakeHost
+        try:
+            w = mp.RemoteWatcher()
+            # 直接塞 hosts，**不要**走 set_hosts —— 它会起后台线程，
+            # 和这里手动调的 _sync 抢同一个假主机，测出来是竞态。
+            w._hosts = ["bbnc"]
+            w._sync("bbnc")
+            snap = w.snapshot()
+        finally:
+            remote_watcher.RemoteHost = old_host
+            w.stop()
+        self.assertEqual(1, len(snap))
+        s = snap[0]
+        self.assertTrue(s["key"].startswith("bbnc:"))
+        self.assertTrue(s["remote"])
+        self.assertEqual("bbnc", s["host"])
+        self.assertEqual("remote-proj", s["project"])
+        self.assertEqual("远端任务", s["task"])
+        # 混进本机的那一套里
+        sw = mp.SessionWatcher()
+        sw.extra = lambda: snap
+        self.assertEqual(1, len(sw.visible_sessions()))
+        self.assertEqual(1, sw.count_active())
+        self.assertEqual("远端任务", sw.active()["task"])
+
+
 class TestNoStrayFiles(unittest.TestCase):
     def test_runtime_artifacts_not_required(self):
         """pet_state.json / pet.log are generated at runtime, not shipped."""

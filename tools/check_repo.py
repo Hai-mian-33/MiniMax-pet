@@ -31,7 +31,7 @@ REQUIRED = [
     "README.md", "README.zh-CN.md", "CONTRIBUTING.md", "CONTRIBUTING.zh-CN.md",
     "LICENSE", ".gitignore",
     "minimax_pet.py", "i18n.py", "autostart.py", "pet_watcher.py",
-    "pet_launcher.py", "build_assets.py",
+    "remote_watcher.py", "pet_launcher.py", "build_assets.py",
     "assets/mascot.png", "assets/mascot_glow.png",
     "tests/run_tests.py", "docs/UPLOAD-GITHUB.md", "docs/UPLOAD-GITHUB.zh-CN.md",
 ]
@@ -181,8 +181,8 @@ def check_readme_images():
 
 
 def check_syntax():
-    for m in ("minimax_pet.py", "i18n.py", "autostart.py",
-              "pet_launcher.py", "build_assets.py"):
+    for m in ("minimax_pet.py", "i18n.py", "autostart.py", "remote_watcher.py",
+              "pet_watcher.py", "pet_launcher.py", "build_assets.py"):
         p = rel(m)
         if not os.path.exists(p):
             continue

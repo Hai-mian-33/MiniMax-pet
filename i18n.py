@@ -281,6 +281,21 @@ STRINGS = {
         "auto.keepalive_undo_cmd": "撤销：python autostart.py keepalive off",
         "auto.keepalive_enable_cmd": "开启：python autostart.py keepalive on",
         "chip.exec_tool": "执行 {0}",
+        # ---- v1.2 远端（SSH）会话 ----
+        "menu.remote": "远程主机（SSH）",
+        "menu.remote_none": "（没找到 ~/.ssh/config 里的别名）",
+        "toast.remote_set": "远端主机：{0}",
+        "toast.remote_copied": "已复制 {0} 上的会话路径（远端会话跳不过去）",
+        "log.remote_set": "远端主机清单：{0}",
+        "log.remote_none": "（空）",
+        "log.remote_started": "远端会话监听已启动",
+        "log.remote_session": "远端会话 {0}/{1}",
+        "log.remote_unreachable": "远端连不上",
+        "log.remote_copied": "已复制远端会话路径：{0} {1}",
+        "cli.remote_hosts": "当前启用的远端主机：",
+        "cli.remote_none": "（还没启用任何远端主机）",
+        "cli.remote_candidates": "~/.ssh/config 里的别名：",
+        "cli.remote_saved": "已保存远端主机清单：{0}",
     },
 
     "en": {
@@ -528,6 +543,21 @@ STRINGS = {
         "auto.keepalive_undo_cmd": "Undo: python autostart.py keepalive off",
         "auto.keepalive_enable_cmd": "Enable: python autostart.py keepalive on",
         "chip.exec_tool": "run {0}",
+        # ---- v1.2 remote (SSH) sessions ----
+        "menu.remote": "Remote hosts (SSH)",
+        "menu.remote_none": "(no aliases found in ~/.ssh/config)",
+        "toast.remote_set": "Remote host: {0}",
+        "toast.remote_copied": "Copied the session path on {0} (remote sessions cannot be jumped to)",
+        "log.remote_set": "Remote hosts: {0}",
+        "log.remote_none": "(none)",
+        "log.remote_started": "Remote session watcher started",
+        "log.remote_session": "Remote session {0}/{1}",
+        "log.remote_unreachable": "remote unreachable",
+        "log.remote_copied": "Copied remote session path: {0} {1}",
+        "cli.remote_hosts": "Enabled remote hosts:",
+        "cli.remote_none": "(no remote host enabled yet)",
+        "cli.remote_candidates": "Aliases in ~/.ssh/config:",
+        "cli.remote_saved": "Saved remote host list: {0}",
     },
 }
 

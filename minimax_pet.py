@@ -29,6 +29,7 @@ MiniMax Pet —— MiniMax Code 桌面版任务进度桌宠
 依赖：  pip install PyQt5
 """
 import argparse
+import base64
 import html
 import json
 import math
@@ -1161,6 +1162,113 @@ def _new_state(key):
             "compacted": False}
 
 
+def _apply_msg(s, line):
+    try:
+        o = json.loads(line)
+    except Exception:
+        return
+    m = o.get("message") or {}
+    role = m.get("role")
+    ts = m.get("timestamp") or 0
+    if ts:
+        s["last_ts"] = ts / 1000.0
+    if role in ("user", "assistant", "toolResult"):
+        # 又来了新动静 → 任务重新活过来，解除用时冻结；
+        # 真正收尾时（assistant 纯文本 / _settle 超时）会再把 t_end 盖上。
+        s["t_end"] = 0.0
+    parts = m.get("content")
+    if isinstance(parts, str):
+        parts = [{"type": "text", "text": parts}]
+
+    if role == "user":
+        text = ""
+        for c in parts or []:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text = c.get("text") or ""
+                break
+        prompt = _clean_prompt(text, m.get("canonicalTextRange"))
+        if not prompt:
+            # 纯系统注入，不是新任务：状态、步数、错误数一律保持不动。
+            return
+        s.update(state="thinking", task=_short(prompt) or t("card.untitled"),
+                 steps=0, errors=0, t0=(ts / 1000.0) or time.time(),
+                 t_end=0.0, pending={}, result="", acked=False)
+        log("task", t("log.new_task", _short(prompt, 70)))
+
+    elif role == "compactionSummary":
+        # 被压缩过的会话：原始提问已被回顾替换，用 summary 补一个像样的标题。
+        # 不改 state / steps —— 这是历史摘要，不代表当前回合。
+        title = _summary_title(m.get("summary") or "")
+        if title and not s["task"]:
+            s["task"] = title
+            s["compacted"] = True
+            log("task", t("log.compacted", title[:60]))
+
+    elif role == "assistant":
+        calls, has_text, has_thinking = [], False, False
+        for c in parts or []:
+            if not isinstance(c, dict):
+                continue
+            # 注意：局部变量不能叫 t，会遮蔽模块级的 i18n 翻译函数 t()
+            ctype = c.get("type")
+            if ctype == "toolCall":
+                calls.append((str(c.get("id") or ""), str(c.get("name") or "?")))
+            elif ctype == "text":
+                if (c.get("text") or "").strip():
+                    has_text = True
+            elif ctype == "thinking":
+                has_thinking = True
+        if calls:
+            for cid, cname in calls:
+                s["pending"][cid] = cname
+            s["tool"] = calls[-1][1]
+            s["state"] = "executing"
+            log("run", "▶ " + calls[-1][1])
+        elif has_text:
+            txt = ""
+            for c in parts or []:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    txt = (c.get("text") or "").strip()
+                    break
+            s["state"] = "done"
+            s["t_end"] = s["last_ts"] or time.time()   # 冻结用时，别再往下走
+            s["result"] = txt
+            log("ok", t("log.turn_end", s["steps"]))
+        elif has_thinking:
+            s["state"] = "thinking"
+
+    elif role == "toolResult":
+        cid = str(m.get("toolCallId") or "")
+        s["pending"].pop(cid, None)
+        s["steps"] += 1
+        failed = bool(m.get("isError"))
+        if failed:
+            s["errors"] += 1
+        name = str(m.get("toolName") or s["tool"] or "?")
+        s["tool"] = name
+        s["state"] = "error" if failed and not s["pending"] else "executing"
+        log("fail" if failed else "ok",
+            t("log.tool_step", ("✗ " if failed else "✓ ") + name, s["steps"]))
+
+
+
+def _settle_state(s, now):
+    if s["pending"]:
+        # 工具已发出但没有回结果：先按执行中，超过阈值再判定为等你确认
+        s["state"] = "waiting"
+        return
+    if s["state"] == "done":
+        if s["last_ts"] and now - s["last_ts"] > 900:
+            s["state"] = "idle"
+        return
+    if s["state"] in ("executing", "error", "thinking") and s["last_ts"]:
+        if now - s["last_ts"] > 45:
+            s["state"] = "done" if s["task"] else "idle"
+            if s["state"] == "done":
+                s["t_end"] = now      # 同上：用时停在这一刻
+
+
+
 class SessionWatcher(QObject):
     """增量 tail 各会话的 messages.jsonl，推导实时任务状态。
 
@@ -1176,6 +1284,8 @@ class SessionWatcher(QObject):
         self._partial = {}      # key -> 尚未读全的行尾
         self._proj_cache = {}   # dir -> (mtime, size, project)
         self._last_scan = 0.0
+        # 额外的会话来源（远端 SSH 上的机器）。是个可调用对象，返回会话列表。
+        self.extra = None
 
     # ---- 发现会话文件 ----
     def _scan_files(self):
@@ -1313,110 +1423,27 @@ class SessionWatcher(QObject):
 
     # ---- 单条消息 ----
     def _apply(self, s, line):
-        try:
-            o = json.loads(line)
-        except Exception:
-            return
-        m = o.get("message") or {}
-        role = m.get("role")
-        ts = m.get("timestamp") or 0
-        if ts:
-            s["last_ts"] = ts / 1000.0
-        if role in ("user", "assistant", "toolResult"):
-            # 又来了新动静 → 任务重新活过来，解除用时冻结；
-            # 真正收尾时（assistant 纯文本 / _settle 超时）会再把 t_end 盖上。
-            s["t_end"] = 0.0
-        parts = m.get("content")
-        if isinstance(parts, str):
-            parts = [{"type": "text", "text": parts}]
-
-        if role == "user":
-            text = ""
-            for c in parts or []:
-                if isinstance(c, dict) and c.get("type") == "text":
-                    text = c.get("text") or ""
-                    break
-            prompt = _clean_prompt(text, m.get("canonicalTextRange"))
-            if not prompt:
-                # 纯系统注入，不是新任务：状态、步数、错误数一律保持不动。
-                return
-            s.update(state="thinking", task=_short(prompt) or t("card.untitled"),
-                     steps=0, errors=0, t0=(ts / 1000.0) or time.time(),
-                     t_end=0.0, pending={}, result="", acked=False)
-            log("task", t("log.new_task", _short(prompt, 70)))
-
-        elif role == "compactionSummary":
-            # 被压缩过的会话：原始提问已被回顾替换，用 summary 补一个像样的标题。
-            # 不改 state / steps —— 这是历史摘要，不代表当前回合。
-            title = _summary_title(m.get("summary") or "")
-            if title and not s["task"]:
-                s["task"] = title
-                s["compacted"] = True
-                log("task", t("log.compacted", title[:60]))
-
-        elif role == "assistant":
-            calls, has_text, has_thinking = [], False, False
-            for c in parts or []:
-                if not isinstance(c, dict):
-                    continue
-                # 注意：局部变量不能叫 t，会遮蔽模块级的 i18n 翻译函数 t()
-                ctype = c.get("type")
-                if ctype == "toolCall":
-                    calls.append((str(c.get("id") or ""), str(c.get("name") or "?")))
-                elif ctype == "text":
-                    if (c.get("text") or "").strip():
-                        has_text = True
-                elif ctype == "thinking":
-                    has_thinking = True
-            if calls:
-                for cid, cname in calls:
-                    s["pending"][cid] = cname
-                s["tool"] = calls[-1][1]
-                s["state"] = "executing"
-                log("run", "▶ " + calls[-1][1])
-            elif has_text:
-                txt = ""
-                for c in parts or []:
-                    if isinstance(c, dict) and c.get("type") == "text":
-                        txt = (c.get("text") or "").strip()
-                        break
-                s["state"] = "done"
-                s["t_end"] = s["last_ts"] or time.time()   # 冻结用时，别再往下走
-                s["result"] = txt
-                log("ok", t("log.turn_end", s["steps"]))
-            elif has_thinking:
-                s["state"] = "thinking"
-
-        elif role == "toolResult":
-            cid = str(m.get("toolCallId") or "")
-            s["pending"].pop(cid, None)
-            s["steps"] += 1
-            failed = bool(m.get("isError"))
-            if failed:
-                s["errors"] += 1
-            name = str(m.get("toolName") or s["tool"] or "?")
-            s["tool"] = name
-            s["state"] = "error" if failed and not s["pending"] else "executing"
-            log("fail" if failed else "ok",
-                t("log.tool_step", ("✗ " if failed else "✓ ") + name, s["steps"]))
-
+        """见模块级 _apply_msg()。"""
+        _apply_msg(s, line)
     # ---- 回合收尾 ----
     def _settle(self, s, now):
-        if s["pending"]:
-            # 工具已发出但没有回结果：先按执行中，超过阈值再判定为等你确认
-            s["state"] = "waiting"
-            return
-        if s["state"] == "done":
-            if s["last_ts"] and now - s["last_ts"] > 900:
-                s["state"] = "idle"
-            return
-        if s["state"] in ("executing", "error", "thinking") and s["last_ts"]:
-            if now - s["last_ts"] > 45:
-                s["state"] = "done" if s["task"] else "idle"
-                if s["state"] == "done":
-                    s["t_end"] = now      # 同上：用时停在这一刻
-
+        """见模块级 _settle_state()。"""
+        _settle_state(s, now)
     # ---- 对外 ----
+    def _all_sessions(self):
+        """本机会话 + 远端（SSH）会话。
+
+        远端会话由 RemoteWatcher 提供，两边用的是同一套状态字段，所以卡片、
+        团子脸、步数统计全都能一视同仁。
+        """
+        out = list(self.sess.values())
+        if self.extra is not None:
+            try:
+                out.extend(self.extra())
+            except Exception:
+                pass
+        return out
+
     def visible_sessions(self):
         """值得显示的会话：进行中 / 未被点掉的。
 
@@ -1425,7 +1452,7 @@ class SessionWatcher(QObject):
         """
         now = time.time()
         out = []
-        for s in self.sess.values():
+        for s in self._all_sessions():
             if s["acked"]:
                 continue
             if s["state"] == "idle":
@@ -1445,7 +1472,7 @@ class SessionWatcher(QObject):
           任务，没有下一个就回待命——不会一直停在旧任务的完成态上；
         - 全部点掉且没有新任务 → 返回一个空的 idle 态，不保留上一个任务的记忆。
         """
-        all_s = list(self.sess.values())
+        all_s = self._all_sessions()
         running = [s for s in all_s if s["state"] in ACTIVE_STATES]
         if running:
             cands = running
@@ -1457,8 +1484,192 @@ class SessionWatcher(QObject):
         return cands[0]
 
     def count_active(self):
-        return sum(1 for s in self.sess.values()
+        return sum(1 for s in self._all_sessions()
                    if s["state"] in ACTIVE_STATES)
+
+
+# ========== 远端（SSH）会话 ==========
+REMOTE_POLL_SEC = 4.0        # 远端轮询间隔（SSH 比读本地文件慢得多）
+
+
+def _load_remote_hosts():
+    """读远端主机清单（SSH 别名）。清单存在 MiniMax Code 的配置目录下。"""
+    try:
+        import remote_watcher
+        return remote_watcher.load_hosts(_STATE_HOME)
+    except Exception:
+        return []
+
+
+def _save_remote_hosts(hosts):
+    try:
+        import remote_watcher
+        return remote_watcher.save_hosts(_STATE_HOME, hosts)
+    except Exception:
+        return False
+
+
+class RemoteWatcher(QObject):
+    """把 SSH 得通的服务器上的 MiniMax Code 会话也拉过来。
+
+    远端的会话目录结构、转录格式和本机**一模一样**，所以解析直接复用
+    本地的 _apply_msg() / _settle_state()，两边行为完全一致。
+
+    SSH 放在**独立后台线程**里：一次握手可能要好几秒，放在 Qt 主线程会把
+    桌宠自己冻住（那才是字面意义上的界面卡死）。
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        import remote_watcher
+        self._rw = remote_watcher
+        self._hosts = []          # [别名]
+        self._lock = threading.Lock()
+        self._sess = {}           # key -> state（工作线程改，主线程只读快照）
+        self._off = {}            # 远端路径 -> 已读字节
+        self._partial = {}        # 远端路径 -> 半行
+        self._clients = {}        # 别名 -> RemoteHost
+        self._stop = threading.Event()
+        self._thread = None
+        self._last_error = {}
+
+    # ---------- 配置 ----------
+    def configured_hosts(self):
+        return list(self._hosts)
+
+    def set_hosts(self, hosts):
+        hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()]
+        with self._lock:
+            self._hosts = hosts
+        self._drop_clients()
+        log("info", t("log.remote_set", ", ".join(hosts) if hosts
+                      else t("log.remote_none")))
+        if hosts and not self._thread:
+            self.start()
+
+    def _drop_clients(self):
+        for name, c in list(self._clients.items()):
+            if name not in self._hosts:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                self._clients.pop(name, None)
+
+    def host_status(self):
+        """[(别名, 连上了吗, 错误信息)]，给菜单显示用。"""
+        out = []
+        with self._lock:
+            names = list(self._hosts)
+        for n in names:
+            c = self._clients.get(n)
+            ok = bool(c and c.alive)
+            out.append((n, ok, (c.error if c else "") if not ok else ""))
+        return out
+
+    # ---------- 线程 ----------
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        log("info", t("log.remote_started"))
+
+    def stop(self):
+        self._stop.set()
+        for c in list(self._clients.values()):
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._clients.clear()
+
+    def _client(self, name):
+        c = self._clients.get(name)
+        if c is None:
+            c = self._rw.RemoteHost(name)
+            self._clients[name] = c
+        return c
+
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                hosts = list(self._hosts)
+            for h in hosts:
+                if self._stop.is_set():
+                    break
+                try:
+                    self._sync(h)
+                except Exception as e:
+                    self._last_error[h] = str(e)
+            self._stop.wait(REMOTE_POLL_SEC)
+
+    # ---------- 拉一次 ----------
+    def _sync(self, host):
+        client = self._client(host)
+        offsets = dict(self._off)
+        items = client.poll(offsets)
+        if items is None:
+            self._last_error[host] = client.error or t("log.remote_unreachable")
+            return
+        self._last_error.pop(host, None)
+        now = time.time()
+        seen = set()
+        touched = False
+        for it in items:
+            path = it.get("path") or ""
+            if not path:
+                continue
+            seen.add(path)
+            key = host + ":" + os.path.basename(path)
+            try:
+                raw = base64.b64decode(it.get("data") or "")
+            except Exception:
+                continue
+            text = raw.decode("utf-8", "replace")
+            lines = (self._partial.get(path, "") + text).split("\n")
+            self._partial[path] = lines.pop()      # 末尾可能半行，留到下次
+            self._off[path] = it.get("size") or 0
+            with self._lock:
+                s = self._sess.get(key)
+                if s is None:
+                    s = _new_state(key)
+                    s["path"] = path
+                    s["host"] = host
+                    s["remote"] = True
+                    s["project"] = it.get("project") or ""
+                    self._sess[key] = s
+                    touched = True
+                    log("session", t("log.remote_session", host,
+                                     os.path.basename(path)[:28]))
+                for line in lines:
+                    line = line.strip()
+                    if line:
+                        _apply_msg(s, line)
+                        touched = True
+                _settle_state(s, now)
+        # 远端已经不存在的会话（被删了 / 超出时间窗）→ 丢掉
+        with self._lock:
+            for key in list(self._sess.keys()):
+                s = self._sess[key]
+                if s.get("remote") and s.get("host") == host and s.get("path") not in seen:
+                    self._sess.pop(key, None)
+                    touched = True
+        if touched:
+            self.changed.emit()
+
+    # ---------- 给主线程的快照 ----------
+    def snapshot(self):
+        with self._lock:
+            out = []
+            for s in self._sess.values():
+                d = dict(s)
+                d["pending"] = dict(s.get("pending") or {})
+                out.append(d)
+            return out
 
 
 # ========== 可选：本地 HTTP 事件入口（便于外部脚本推送 / 演示）==========
@@ -2304,6 +2515,12 @@ class PetWindow(QWidget):
 
         self.watcher = SessionWatcher(self)
         self.watcher.changed.connect(self.refresh)
+        # 远端（SSH）上的会话：独立后台线程拉取，解析复用同一套逻辑。
+        self.remote = RemoteWatcher(self)
+        self.remote.changed.connect(self.refresh)
+        self.watcher.extra = self.remote.snapshot
+        self._remote_hosts = _load_remote_hosts()
+        self.remote.set_hosts(self._remote_hosts)
 
         self._build_ui()
         self._restore_pos()
@@ -2414,12 +2631,48 @@ class PetWindow(QWidget):
             a.triggered.connect(lambda _c=False, l=lg: self._set_lang(l))
         return sub
 
+    def _add_remote_menu(self, m):
+        """「远程主机（SSH）」子菜单。
+
+        候选就是 ~/.ssh/config 里的 Host 别名，勾上 = 启用。启用后桌宠会
+        定时把那台机器上的 MiniMax Code 会话也拉过来显示。
+        """
+        sub = m.addMenu(t("menu.remote"))
+        try:
+            import remote_watcher
+            aliases = remote_watcher.ssh_config_aliases()
+        except Exception:
+            aliases = []
+        cur = set(self._remote_hosts)
+        if not aliases:
+            sub.addAction(t("menu.remote_none"))
+            return sub
+        for a in aliases[:16]:
+            act = sub.addAction(a)
+            act.setCheckable(True)
+            act.setChecked(a in cur)
+            act.triggered.connect(lambda _c=False, n=a: self._toggle_remote(n))
+        return sub
+
+    def _toggle_remote(self, name):
+        cur = list(self._remote_hosts)
+        if name in cur:
+            cur.remove(name)
+        else:
+            cur.append(name)
+        self._remote_hosts = cur
+        _save_remote_hosts(cur)
+        self.remote.set_hosts(cur)
+        self._refresh_menus()
+        self._toast_msg(t("toast.remote_set", name), 2.5)
+
     def _build_menu(self):
         m = QMenu()
         m.addAction(t("menu.show_pet"), self.toggle_visible)
         m.addAction(t("menu.show_cards"), self.toggle_cards)
         m.addSeparator()
         self._add_follow_menu(m)
+        self._add_remote_menu(m)
         m.addSeparator()
         m.addAction(t("menu.jump"), lambda: self.jump_app(None))
         m.addAction(t("menu.demo"), self.run_demo)
@@ -2916,6 +3169,7 @@ class PetWindow(QWidget):
                     else t("menu.expand_cards", self.cards.total()),
                     self._on_cards_toggle)
         self._add_follow_menu(m)
+        self._add_remote_menu(m)
         m.addSeparator()
         m.addAction(t("menu.jump"), lambda: self.jump_app(None))
         m.addAction(t("menu.demo"), self.run_demo)
@@ -2975,6 +3229,11 @@ class PetWindow(QWidget):
             else:
                 status = mood_name(state)
             proj = s.get("project") or ""
+            if s.get("remote"):
+                # 远端会话：项目名前面挂上主机名，否则分不清是哪台机器上的。
+                # 主机名放在**最前面**，因为项目名是最先被省略的那个。
+                host = s.get("host") or "?"
+                proj = (host + "/" + proj) if proj else host
             out.append({"key": s["key"],
                         "title": s["task"] or t("card.untitled"),
                         "status": status,
@@ -3050,6 +3309,28 @@ class PetWindow(QWidget):
         self.move(QPoint(int(round(cx - need / 2.0)), self.y()))
         self._clamp_pos()
 
+    def _remote_state(self, key):
+        """从远端快照里找会话。"""
+        try:
+            for s in self.remote.snapshot():
+                if s.get("key") == key:
+                    return s
+        except Exception:
+            pass
+        return None
+
+    def _copy_remote(self, key, s):
+        """远端会话：把路径复制到剪贴板，并提示是哪台机器。"""
+        path = s.get("path") or ""
+        host = s.get("host") or "?"
+        try:
+            QApplication.clipboard().setText(path)
+        except Exception:
+            pass
+        log("info", t("log.remote_copied", host, path))
+        self._toast_msg(t("toast.remote_copied", host), 4.0)
+        self.refresh(force=True)
+
     # ---------- 跳转 ----------
     # ---------- 跳转 ----------
     _ACT_TIPS = {
@@ -3069,6 +3350,12 @@ class PetWindow(QWidget):
         再等新窗口冒头，最坏十几秒。放在 Qt 主线程里做这些，桌宠自己先冻住
         ——那才是字面意义上的界面卡死。
         """
+        # 远端（SSH）会话没有「跳过去」这个概念 —— 本机窗口里并不是那个会话。
+        # 改成把远端会话路径复制到剪贴板，并明确告诉用户这是哪台机器上的。
+        s = self.watcher.sess.get(key) or self._remote_state(key)
+        if s and s.get("remote"):
+            self._copy_remote(key, s)
+            return
         if self._act_busy:
             self._toast_msg(t("toast.jump_busy"), 1.5)
             return
@@ -3217,6 +3504,10 @@ class PetWindow(QWidget):
                 pass
         if self.tray:
             self.tray.hide()
+        try:
+            self.remote.stop()          # 关掉常驻的 SSH 通道
+        except Exception:
+            pass
         log("info", t("log.quit"))
         QApplication.quit()
 
@@ -3470,7 +3761,36 @@ def main():
     ap.add_argument("--probe-activate", action="store_true",
                     help="只跑一遍「召唤 MiniMax Code」链路并打印每一步后退出"
                          " / print the summon pipeline step by step, then exit")
+    ap.add_argument("--remote-host", action="append", default=[],
+                    metavar="ALIAS",
+                    help="启用一台远端机器（SSH 别名，可重复）；"
+                         "桌宠会把它上面的 MiniMax Code 会话也显示出来"
+                         " / enable a remote SSH host")
+    ap.add_argument("--remote-hosts", action="store_true",
+                    help="列出当前启用的远端机器与连接状态后退出"
+                         " / list enabled remote hosts and their status")
     a = ap.parse_args()
+
+    if a.remote_hosts:
+        import remote_watcher
+        hs = _load_remote_hosts()
+        print(t("cli.remote_hosts"))
+        for h in hs:
+            print("   " + h)
+        if not hs:
+            print(t("cli.remote_none"))
+        print(t("cli.remote_candidates") +
+              ", ".join(remote_watcher.ssh_config_aliases()))
+        return 0
+
+    if a.remote_host:
+        hs = _load_remote_hosts()
+        for h in a.remote_host:
+            h = h.strip()
+            if h and h not in hs:
+                hs.append(h)
+        _save_remote_hosts(hs)
+        print(t("cli.remote_saved", ", ".join(hs)))
 
     st = load_state()
     # 语言优先级：命令行 > 上次选择 > 系统语言

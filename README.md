@@ -202,6 +202,45 @@ it never crashes.
 
 ---
 
+## Remote hosts over SSH
+
+The pet can also show tasks that are running on **another machine** — as long as
+that machine runs MiniMax Code and you can reach it over SSH. The remote session
+tree and its transcript format are identical to the local ones, so the very same
+parser drives both.
+
+```bash
+python minimax_pet.py --remote-host bbnc      # add a host (repeatable)
+python minimax_pet.py --remote-hosts          # what is enabled, and is it up?
+```
+
+You can also tick hosts from the tray menu (**Remote hosts (SSH)**); the list
+comes from the `Host` aliases in your `~/.ssh/config`.
+
+How it works
+* One **persistent** `ssh host "python3 -u -c ..."` channel per host. The remote
+  script is handed over base64-encoded on the command line, so stdin stays free
+  for the request/response protocol.
+* Every poll the pet tells the remote **how many bytes it already has**; the
+  remote sends back only the new ones. This matters: the parser counts steps
+  with `steps += 1`, which is *not* idempotent — replaying old lines would
+  inflate the counters.
+* Everything about the remote is **read-only**: the remote script only opens
+  the transcripts for reading.
+* The remote session shows up as a normal card, prefixed with the host name
+  (`bbnc/my-project`). Clicking it copies the remote session path to the
+  clipboard — a remote session cannot be "jumped to" from your desktop.
+
+The host list is stored with the rest of the runtime state (next to
+`pet_state.json`), **not** in the code folder.
+
+> A note on the screenshots in `docs/images/`: the mascot blinks, so a fresh
+> `--selftest` run does not produce byte-identical PNGs. That is why regenerating
+> them shows up as a diff even when no layout changed — check the images before
+> committing them.
+
+---
+
 ## Command line
 
 | Flag | Meaning |
@@ -216,6 +255,8 @@ it never crashes.
 | `--exit-with-app` | Quit the pet when MiniMax Code quits (**on by default**) |
 | `--always-show` | Show at launch regardless of the app (debugging) |
 | `--no-server` | Disable the local HTTP event bridge |
+| `--remote-host ALIAS` | Also show MiniMax Code sessions from an SSH host (repeatable) |
+| `--remote-hosts` | List the enabled remote hosts, then exit |
 
 ---
 
@@ -282,6 +323,7 @@ MiniMax exits** in the tray menu.
 MiniMax-pet/
 ├── minimax_pet.py            # the pet: watcher, widgets, tray, HTTP bridge
 ├── pet_watcher.py            # headless sign-in sentinel — no Qt, no window
+├── remote_watcher.py         # pull MiniMax Code sessions over SSH
 ├── i18n.py                   # zh / en string tables — the single source of truth
 ├── autostart.py              # register / unregister sign-in standby
 ├── pet_launcher.py           # thin wrapper used by the startup entry
