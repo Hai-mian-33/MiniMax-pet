@@ -280,6 +280,7 @@ STRINGS = {
         "auto.keepalive_note_txt": "哨兵和桌宠都被清掉时，把哨兵补回来（不会解除「用户手动退出」的暂停）",
         "auto.keepalive_undo_cmd": "撤销：python autostart.py keepalive off",
         "auto.keepalive_enable_cmd": "开启：python autostart.py keepalive on",
+        "chip.exec_tool": "执行 {0}",
     },
 
     "en": {
@@ -526,6 +527,7 @@ STRINGS = {
         "auto.keepalive_note_txt": "brings the sentinel back when both the sentinel and the pet are gone (it does NOT clear a manual quit)",
         "auto.keepalive_undo_cmd": "Undo: python autostart.py keepalive off",
         "auto.keepalive_enable_cmd": "Enable: python autostart.py keepalive on",
+        "chip.exec_tool": "run {0}",
     },
 }
 

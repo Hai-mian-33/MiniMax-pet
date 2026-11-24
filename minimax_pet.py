@@ -99,6 +99,8 @@ BG        = "#161616"
 BORDER    = "#2A2A2A"
 FG        = "#FFFFFF"
 FG_SUBTLE = "#A1A1A1"
+# 用时比项目名更该被一眼看见，所以给它亮一档的灰
+META_BRIGHT = "#C6CBD3"
 SUCCESS   = "#4ADE80"
 DESTRUCT  = "#EF4444"
 WARNING   = "#FBBF24"
@@ -1928,7 +1930,8 @@ class TaskCard(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(_px(CARD_H))
-        self.d = {"title": "", "status": "", "meta": "", "color": FG_SUBTLE,
+        self.d = {"title": "", "status": "", "meta": "", "project": "",
+                  "elapsed": "", "color": FG_SUBTLE,
                   "kind": "idle", "key": ""}
         self._hover = False
 
@@ -1955,10 +1958,11 @@ class TaskCard(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 30 if self._hover else 18), 1))
         p.setBrush(QColor(24, 26, 30, 242 if self._hover else 232))
         p.drawRoundedRect(body.adjusted(0.5, 0.5, -0.5, -0.5), r, r)
-        # 左侧状态色条
+        # 左侧状态色条。往里收一点，别顶在圆角上被切掉。
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(self.d["color"]))
-        p.drawRoundedRect(QRectF(0, h * 0.22, _px(3), h * 0.56), _px(1.5), _px(1.5))
+        p.drawRoundedRect(QRectF(_px(5), h * 0.26, _px(3), h * 0.48),
+                          _px(1.5), _px(1.5))
 
         pad = _px(13)
         right = _px(12)
@@ -1970,23 +1974,73 @@ class TaskCard(QWidget):
         f_status = ui_font(_fpx(11))
         f_meta = ui_font(_fpx(10), bold=False)
         fm_t, fm_s, fm_m = (QFontMetrics(f) for f in (f_title, f_status, f_meta))
-        meta_w = fm_m.horizontalAdvance(self.d["meta"]) + _px(2)
-        text_w = icon_cx - icon_r - _px(8) - (pad + _px(4))
+
+        # 图标左边那一列的**总**宽度，标题行和第二行都从这里面分。
+        col_w = max(_px(40), icon_cx - icon_r - _px(8) - pad)
 
         # 行高由字体度量决定，不能写死 _px(17)/_px(16)——那跟着 SIZE_RATIO 缩，
         # 字号一旦独立放大就会被裁掉。两行整体在卡片里垂直居中。
         row_t, row_b = fm_t.height(), max(fm_s.height(), fm_m.height())
         gap = max(2, _px(3))
         top = (h - (row_t + gap + row_b)) / 2.0
-        top_rect = QRectF(pad, top, text_w, row_t)
-        bot_rect = QRectF(pad, top + row_t + gap, text_w, row_b)
-        _draw_text(p, top_rect, _elide(fm_t, self.d["title"], text_w),
+        top_rect = QRectF(pad, top, col_w, row_t)
+
+        # ---------- 第二行：左「状态」 右「项目 · 用时」 ----------
+        # 这两列的宽度必须**一起**算。以前左边按整列宽度画、右边的项目名又
+        # 贴在图标左边，于是「执行 read」和项目名叠在同一块地方，糊成一团
+        # （用户截图里的那个问题）。现在先给右列算预算，左列再拿剩下的，
+        # 两列**永不重叠**。
+        col_gap = _px(9)
+        min_status = _px(30)
+        elapsed = self.d.get("elapsed") or ""
+        proj = self.d.get("project") or ""
+        time_w = fm_m.horizontalAdvance(elapsed)
+        sep_w = fm_m.horizontalAdvance(" · ") if proj else 0
+        # 右列整体预算：最多占六成，而且必须给左边的状态留够位置。
+        right_budget = col_w * 0.6
+        right_budget = min(right_budget,
+                           max(0.0, col_w - min_status - col_gap))
+        # 项目名先被削，用时永远留着（它很短，而且一直在走，最该看见）。
+        proj_budget = max(0.0, right_budget - time_w - sep_w)
+        proj_text = (_elide(fm_m, proj, proj_budget)
+                     if (proj and proj_budget > 0) else "")
+        proj_w = fm_m.horizontalAdvance(proj_text)
+        right_w = proj_w + sep_w + time_w
+        status_w = max(min_status, col_w - right_w - col_gap)
+        status_text = _elide(fm_s, self.d["status"], status_w)
+
+        bot_rect = QRectF(pad, top + row_t + gap, status_w, row_b)
+        # 状态加一层淡色底：层次更清楚，比纯文字更醒目
+        sw = fm_s.horizontalAdvance(status_text)
+        if sw > 0:
+            chip_h = min(row_b, _px(16))
+            chip = QRectF(pad, bot_rect.y() + (row_b - chip_h) / 2.0,
+                          sw + _px(11), chip_h)
+            tint = QColor(self.d["color"])
+            tint.setAlpha(44)
+            p.setPen(Qt.NoPen)
+            p.setBrush(tint)
+            p.drawRoundedRect(chip, chip_h / 2.0, chip_h / 2.0)
+        _draw_text(p, bot_rect, status_text, f_status, self.d["color"],
+                   Qt.AlignLeft | Qt.AlignVCenter)
+        # 右列整体**右对齐**到图标左边：项目名的位置固定，不会因为左边状态
+        # 文字变长变短而左右跳。项目名和用时分色：时间更醒目。
+        right_edge = icon_cx - icon_r - _px(6)
+        time_x = right_edge - time_w
+        sep_x = time_x - sep_w
+        proj_x = sep_x - proj_w
+        if proj_text:
+            _draw_text(p, QRectF(proj_x, bot_rect.y(), proj_w, row_b),
+                       proj_text, f_meta, FG_SUBTLE,
+                       Qt.AlignLeft | Qt.AlignVCenter)
+        if sep_w:
+            _draw_text(p, QRectF(sep_x, bot_rect.y(), sep_w, row_b),
+                       " · ", f_meta, FG_SUBTLE, Qt.AlignLeft | Qt.AlignVCenter)
+        _draw_text(p, QRectF(time_x, bot_rect.y(), time_w, row_b),
+                   elapsed, f_meta, META_BRIGHT, Qt.AlignLeft | Qt.AlignVCenter)
+
+        _draw_text(p, top_rect, _elide(fm_t, self.d["title"], col_w),
                    f_title, FG, Qt.AlignLeft | Qt.AlignVCenter)
-        _draw_text(p, bot_rect, _elide(fm_s, self.d["status"], text_w),
-                   f_status, self.d["color"], Qt.AlignLeft | Qt.AlignVCenter)
-        _draw_text(p, QRectF(icon_cx - icon_r - _px(6) - meta_w,
-                             bot_rect.y(), meta_w, row_b),
-                   self.d["meta"], f_meta, FG_SUBTLE, Qt.AlignRight | Qt.AlignVCenter)
 
 
 def _elide(fm, text, width):
@@ -2921,10 +2975,14 @@ class PetWindow(QWidget):
             else:
                 status = mood_name(state)
             proj = s.get("project") or ""
-            meta = (proj + " · " if proj else "") + elapsed_str(s)
             out.append({"key": s["key"],
                         "title": s["task"] or t("card.untitled"),
-                        "status": status, "meta": meta,
+                        "status": status,
+                        # 项目名和用时**分开存**：空间不够时只削项目名，
+                        # 用时永远留着（它很短，而且一直在走，是最该看见的信息）。
+                        "project": proj,
+                        "elapsed": elapsed_str(s),
+                        "meta": (proj + " · " if proj else "") + elapsed_str(s),
                         "color": color, "kind": state})
         return out
 
@@ -2935,7 +2993,10 @@ class PetWindow(QWidget):
         n = self.watcher.count_active()
         bits = {
             "thinking": t("mood.thinking"),
-            "executing": ellipsize(s.get("tool") or t("chip.exec_generic"), 10),
+            # 光写个工具名（"read"）看不出在干什么，胶囊小但也要说人话：
+            # 「执行 read」。
+            "executing": (ellipsize(t("chip.exec_tool", s.get("tool")), 14)
+                          if s.get("tool") else t("chip.exec_generic")),
             "waiting": t("mood.waiting"),
             "error": t("mood.error"),
             "done": t("chip.done", s["steps"], elapsed_str(s)),
